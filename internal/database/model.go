@@ -4,9 +4,13 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 )
+
+// RootPath is the global root storage path, initialized at program startup.
+var RootPath string
 
 type User struct {
 	Id           uint64 `db:"id"`
@@ -49,14 +53,20 @@ func (le *LstEntity) Path() string {
 	if le.ParentDir == "" || le.Name == "" {
 		panic("no enough info to get path")
 	}
-	return filepath.Join(le.ParentDir, le.Name)
+	if filepath.IsAbs(le.ParentDir) {
+		return filepath.Join(le.ParentDir, le.Name)
+	}
+	return filepath.Join(RootPath, le.ParentDir, le.Name)
 }
 
 func (ue *UserEntity) Path() string {
 	if ue.ParentDir == "" || ue.Name == "" {
 		panic("no enough info to get path")
 	}
-	return filepath.Join(ue.ParentDir, ue.Name)
+	if filepath.IsAbs(ue.ParentDir) {
+		return filepath.Join(ue.ParentDir, ue.Name)
+	}
+	return filepath.Join(RootPath, ue.ParentDir, ue.Name)
 }
 
 func (ul *UserLink) Path(db *sqlx.DB) (string, error) {
@@ -70,3 +80,29 @@ func (ul *UserLink) Path(db *sqlx.DB) (string, error) {
 
 	return filepath.Join(le.Path(), ul.Name), nil
 }
+
+type TweetRecord struct {
+	Id        uint64    `db:"id"`
+	UserId    uint64    `db:"user_id"`
+	Text      string    `db:"text"`
+	CreatedAt time.Time `db:"created_at"`
+}
+
+type MediaFileRecord struct {
+	Id               int64          `db:"id"`
+	TweetId          uint64         `db:"tweet_id"`
+	Url              string         `db:"url"`
+	Filename         string         `db:"filename"`
+	OriginalFilename string         `db:"original_filename"`
+	DownloadStatus   int            `db:"download_status"`
+	DownloadedAt     sql.NullTime   `db:"downloaded_at"`
+	FileSize         sql.NullInt64  `db:"file_size"`
+}
+
+type RollbackLog struct {
+	Id         int64     `db:"id"`
+	OldPath    string    `db:"old_path"`
+	NewPath    string    `db:"new_path"`
+	MigratedAt time.Time `db:"migrated_at"`
+}
+

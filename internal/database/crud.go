@@ -69,7 +69,36 @@ CREATE TABLE IF NOT EXISTS user_links (
 	FOREIGN KEY(parent_lst_entity_id) REFERENCES lst_entities (id)
 );
 
+CREATE TABLE IF NOT EXISTS tweets (
+	id INTEGER NOT NULL PRIMARY KEY,
+	user_id INTEGER NOT NULL,
+	text TEXT NOT NULL,
+	created_at DATETIME NOT NULL,
+	FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS media_files (
+	id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+	tweet_id INTEGER NOT NULL,
+	url VARCHAR NOT NULL,
+	filename VARCHAR NOT NULL,
+	original_filename VARCHAR NOT NULL,
+	download_status INTEGER NOT NULL DEFAULT 0,
+	downloaded_at DATETIME,
+	file_size INTEGER,
+	FOREIGN KEY(tweet_id) REFERENCES tweets(id),
+	UNIQUE (tweet_id, url)
+);
+
+CREATE TABLE IF NOT EXISTS rollback_logs (
+	id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+	old_path VARCHAR NOT NULL,
+	new_path VARCHAR NOT NULL,
+	migrated_at DATETIME NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_user_links_user_id ON user_links (user_id);
+CREATE INDEX IF NOT EXISTS idx_media_files_tweet_id ON media_files(tweet_id);
 `
 
 func CreateTables(db *sqlx.DB) {
@@ -109,11 +138,14 @@ func UpdateUser(db *sqlx.DB, usr *User) error {
 }
 
 func CreateUserEntity(db *sqlx.DB, entity *UserEntity) error {
-	abs, err := filepath.Abs(entity.ParentDir)
-	if err != nil {
-		return err
+	parentDir := entity.ParentDir
+	if filepath.IsAbs(parentDir) {
+		rel, err := filepath.Rel(RootPath, parentDir)
+		if err == nil {
+			parentDir = rel
+		}
 	}
-	entity.ParentDir = abs
+	entity.ParentDir = parentDir
 
 	stmt := `INSERT INTO user_entities(user_id, name, parent_dir) VALUES(:user_id, :name, :parent_dir)`
 	de, err := db.NamedExec(stmt, entity)
@@ -135,15 +167,17 @@ func DelUserEntity(db *sqlx.DB, id uint32) error {
 	return err
 }
 
-func LocateUserEntity(db *sqlx.DB, uid uint64, parentDIr string) (*UserEntity, error) {
-	parentDIr, err := filepath.Abs(parentDIr)
-	if err != nil {
-		return nil, err
+func LocateUserEntity(db *sqlx.DB, uid uint64, parentDir string) (*UserEntity, error) {
+	if filepath.IsAbs(parentDir) {
+		rel, err := filepath.Rel(RootPath, parentDir)
+		if err == nil {
+			parentDir = rel
+		}
 	}
 
 	stmt := `SELECT * FROM user_entities WHERE user_id=? AND parent_dir=?`
 	result := &UserEntity{}
-	err = db.Get(result, stmt, uid, parentDIr)
+	err := db.Get(result, stmt, uid, parentDir)
 	if err == sql.ErrNoRows {
 		err = nil
 		result = nil
@@ -219,11 +253,14 @@ func UpdateLst(db *sqlx.DB, lst *Lst) error {
 }
 
 func CreateLstEntity(db *sqlx.DB, entity *LstEntity) error {
-	abs, err := filepath.Abs(entity.ParentDir)
-	if err != nil {
-		return err
+	parentDir := entity.ParentDir
+	if filepath.IsAbs(parentDir) {
+		rel, err := filepath.Rel(RootPath, parentDir)
+		if err == nil {
+			parentDir = rel
+		}
 	}
-	entity.ParentDir = abs
+	entity.ParentDir = parentDir
 
 	stmt := `INSERT INTO lst_entities(id, lst_id, name, parent_dir) VALUES(:id, :lst_id, :name, :parent_dir)`
 	r, err := db.NamedExec(stmt, &entity)
@@ -259,14 +296,16 @@ func GetLstEntity(db *sqlx.DB, id int) (*LstEntity, error) {
 }
 
 func LocateLstEntity(db *sqlx.DB, lid int64, parentDir string) (*LstEntity, error) {
-	parentDir, err := filepath.Abs(parentDir)
-	if err != nil {
-		return nil, err
+	if filepath.IsAbs(parentDir) {
+		rel, err := filepath.Rel(RootPath, parentDir)
+		if err == nil {
+			parentDir = rel
+		}
 	}
 
 	stmt := `SELECT * FROM lst_entities WHERE lst_id=? AND parent_dir=?`
 	result := &LstEntity{}
-	err = db.Get(result, stmt, lid, parentDir)
+	err := db.Get(result, stmt, lid, parentDir)
 	if err == sql.ErrNoRows {
 		err = nil
 		result = nil
@@ -341,4 +380,98 @@ func UpdateUserLink(db *sqlx.DB, id int32, name string) error {
 	stmt := `UPDATE user_links SET name = ? WHERE id = ?`
 	_, err := db.Exec(stmt, name, id)
 	return err
+}
+
+func SaveTweet(db *sqlx.DB, tweet *TweetRecord) error {
+	stmt := `INSERT OR IGNORE INTO tweets(id, user_id, text, created_at) VALUES(?, ?, ?, ?)`
+	_, err := db.Exec(stmt, tweet.Id, tweet.UserId, tweet.Text, tweet.CreatedAt)
+	return err
+}
+
+func SaveTweetTx(tx *sqlx.Tx, tweet *TweetRecord) error {
+	stmt := `INSERT OR IGNORE INTO tweets(id, user_id, text, created_at) VALUES(?, ?, ?, ?)`
+	_, err := tx.Exec(stmt, tweet.Id, tweet.UserId, tweet.Text, tweet.CreatedAt)
+	return err
+}
+
+func SaveMediaFile(db *sqlx.DB, media *MediaFileRecord) error {
+	stmt := `INSERT OR REPLACE INTO media_files(tweet_id, url, filename, original_filename, download_status, downloaded_at, file_size) VALUES(?, ?, ?, ?, ?, ?, ?)`
+	_, err := db.Exec(stmt, media.TweetId, media.Url, media.Filename, media.OriginalFilename, media.DownloadStatus, media.DownloadedAt, media.FileSize)
+	return err
+}
+
+func SaveMediaFileTx(tx *sqlx.Tx, media *MediaFileRecord) error {
+	stmt := `INSERT OR REPLACE INTO media_files(tweet_id, url, filename, original_filename, download_status, downloaded_at, file_size) VALUES(?, ?, ?, ?, ?, ?, ?)`
+	_, err := tx.Exec(stmt, media.TweetId, media.Url, media.Filename, media.OriginalFilename, media.DownloadStatus, media.DownloadedAt, media.FileSize)
+	return err
+}
+
+func GetMediaFile(db *sqlx.DB, tweetId uint64, url string) (*MediaFileRecord, error) {
+	stmt := `SELECT * FROM media_files WHERE tweet_id = ? AND url = ?`
+	res := &MediaFileRecord{}
+	err := db.Get(res, stmt, tweetId, url)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return res, err
+}
+
+func MigrateDatabase(db *sqlx.DB, rootPath string) error {
+	// 1. Ensure schema is created (including new tables)
+	db.MustExec(schema)
+
+	// 2. Perform path migration: convert absolute paths to relative paths
+	tx, err := db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Migrate user_entities
+	type TempUserEntity struct {
+		Id        int    `db:"id"`
+		ParentDir string `db:"parent_dir"`
+	}
+	var userEntities []TempUserEntity
+	err = tx.Select(&userEntities, "SELECT id, parent_dir FROM user_entities")
+	if err != nil {
+		return err
+	}
+
+	for _, ue := range userEntities {
+		if filepath.IsAbs(ue.ParentDir) {
+			rel, err := filepath.Rel(rootPath, ue.ParentDir)
+			if err == nil {
+				_, err = tx.Exec("UPDATE user_entities SET parent_dir = ? WHERE id = ?", rel, ue.Id)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Migrate lst_entities
+	type TempLstEntity struct {
+		Id        int    `db:"id"`
+		ParentDir string `db:"parent_dir"`
+	}
+	var lstEntities []TempLstEntity
+	err = tx.Select(&lstEntities, "SELECT id, parent_dir FROM lst_entities")
+	if err != nil {
+		return err
+	}
+
+	for _, le := range lstEntities {
+		if filepath.IsAbs(le.ParentDir) {
+			rel, err := filepath.Rel(rootPath, le.ParentDir)
+			if err == nil {
+				_, err = tx.Exec("UPDATE lst_entities SET parent_dir = ? WHERE id = ?", rel, le.Id)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return tx.Commit()
 }

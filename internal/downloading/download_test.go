@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/unkmonster/tmd/internal/database"
@@ -355,4 +357,58 @@ func generateSomeTweets(n int) []*twitter.Tweet {
 		res = append(res, tw)
 	}
 	return res
+}
+
+func TestGenerateFileName(t *testing.T) {
+	createdAt, _ := time.Parse("2006-01-02", "2026-06-19")
+	tweetId := uint64(1803724783284920384)
+	index := 1
+	ext := ".jpg"
+
+	// 1. Test standard short text
+	text := "Hello World"
+	trunc, orig := GenerateFileName(createdAt, tweetId, index, text, ext)
+	wantTrunc := "20260619_1803724783284920384_1_Hello World.jpg"
+	if trunc != wantTrunc {
+		t.Errorf("GenerateFileName trunc failed: got %q, want %q", trunc, wantTrunc)
+	}
+	if orig != wantTrunc {
+		t.Errorf("GenerateFileName orig failed: got %q, want %q", orig, wantTrunc)
+	}
+
+	// 2. Test text with invalid Windows filename characters
+	textWithInvalid := "Hello/World:*?\"<>|"
+	trunc, _ = GenerateFileName(createdAt, tweetId, index, textWithInvalid, ext)
+	wantClean := "20260619_1803724783284920384_1_HelloWorld.jpg"
+	if trunc != wantClean {
+		t.Errorf("GenerateFileName invalid chars failed: got %q, want %q", trunc, wantClean)
+	}
+
+	// 3. Test extremely long text (exceeding 200 chars)
+	longText := ""
+	for i := 0; i < 300; i++ {
+		longText += "A"
+	}
+	trunc, orig = GenerateFileName(createdAt, tweetId, index, longText, ext)
+	if len(trunc) > 200 {
+		t.Errorf("GenerateFileName trunc failed: length %d is > 200", len(trunc))
+	}
+	if len(orig) <= 200 {
+		t.Errorf("GenerateFileName orig should not be truncated to 200: length %d", len(orig))
+	}
+
+	// 4. Test safe UTF-8 truncation (using Chinese characters)
+	chineseText := ""
+	for i := 0; i < 100; i++ {
+		chineseText += "测"
+	}
+	trunc, _ = GenerateFileName(createdAt, tweetId, index, chineseText, ext)
+	if len(trunc) > 200 {
+		t.Errorf("GenerateFileName UTF-8 trunc failed: length %d > 200", len(trunc))
+	}
+
+	cleanTextPart := strings.TrimSuffix(strings.TrimPrefix(trunc, "20260619_1803724783284920384_1_"), ".jpg")
+	if !utf8.ValidString(cleanTextPart) {
+		t.Errorf("GenerateFileName UTF-8 truncation produced invalid UTF-8 string: %q", cleanTextPart)
+	}
 }

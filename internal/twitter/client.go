@@ -175,15 +175,46 @@ func (rl *xRateLimit) preRequest(ctx context.Context, nonBlocking bool) error {
 func makeRateLimit(resp *resty.Response) *xRateLimit {
 	header := resp.Header()
 	limit := header.Get("X-Rate-Limit-Limit")
-	if limit == "" {
-		return nil // 没有速率限制信息
-	}
 	remaining := header.Get("X-Rate-Limit-Remaining")
-	if remaining == "" {
-		return nil // 没有速率限制信息
-	}
 	resetTime := header.Get("X-Rate-Limit-Reset")
-	if resetTime == "" {
+
+	u, _ := url.Parse(resp.Request.URL)
+	urlPath := filepath.Join(u.Host, u.Path)
+
+	// If HTTP status is 429, we are rate limited. Create a rate limit even if headers are missing.
+	if resp.StatusCode() == 429 {
+		var limitNum int = 1
+		var remainingNum int = 0
+		var resetTimeTime time.Time
+
+		if resetTime != "" {
+			if resetTimeNum, err := strconv.ParseInt(resetTime, 10, 64); err == nil {
+				resetTimeTime = time.Unix(resetTimeNum, 0)
+			}
+		}
+		if resetTimeTime.IsZero() {
+			resetTimeTime = time.Now().Add(2 * time.Minute)
+		}
+
+		if limit != "" {
+			limitNum, _ = strconv.Atoi(limit)
+		}
+		if remaining != "" {
+			remainingNum, _ = strconv.Atoi(remaining)
+		}
+
+		log.Warnf("[RateLimiter] Forcing 429 rate limit fallback (duration: 2m) for path: %s", urlPath)
+
+		return &xRateLimit{
+			ResetTime: resetTimeTime,
+			Remaining: remainingNum,
+			Limit:     limitNum,
+			Ready:     true,
+			Url:       urlPath,
+		}
+	}
+
+	if limit == "" || remaining == "" || resetTime == "" {
 		return nil // 没有速率限制信息
 	}
 
@@ -200,16 +231,13 @@ func makeRateLimit(resp *resty.Response) *xRateLimit {
 		return nil
 	}
 
-	u, _ := url.Parse(resp.Request.URL)
-	url := filepath.Join(u.Host, u.Path)
-
 	resetTimeTime := time.Unix(resetTimeNum, 0)
 	return &xRateLimit{
 		ResetTime: resetTimeTime,
 		Remaining: remainingNum,
 		Limit:     limitNum,
 		Ready:     true,
-		Url:       url,
+		Url:       urlPath,
 	}
 }
 
@@ -294,8 +322,15 @@ func (rateLimiter *rateLimiter) reset(url *url.URL, resp *resty.Response) {
 	if resp != nil && resp.RawResponse != nil {
 		// 请求成功，或发生了错误/触发了重试条件但有能力更新速率限制
 		rateLimit := makeRateLimit(resp)
-		rateLimiter.limits.Store(path, rateLimit)
-		cond.Broadcast()
+		if rateLimit != nil {
+			rateLimiter.limits.Store(path, rateLimit)
+			cond.Broadcast()
+		} else {
+			// If makeRateLimit returned nil (meaning no rate limit info in response),
+			// delete the key so the next request will reload/re-initialize it.
+			rateLimiter.limits.Delete(path)
+			cond.Signal()
+		}
 	} else {
 		// 将此路径设为首次请求前的状态
 		rateLimiter.limits.Delete(path)
@@ -314,20 +349,30 @@ func (rl *rateLimiter) wouldBlock(path string) bool {
 	return false
 }
 
+func SetRateLimitBlocking(client *resty.Client, blocking bool) {
+	if v, ok := clientRateLimiters.Load(client); ok {
+		rl := v.(*rateLimiter)
+		log.Infof("[RateLimiter] SetRateLimitBlocking: changing nonBlocking from %v to %v for client %p", rl.nonBlocking, !blocking, client)
+		rl.nonBlocking = !blocking
+	} else {
+		log.Warnf("[RateLimiter] SetRateLimitBlocking: client %p not found in rate limiters map", client)
+	}
+}
+
 func EnableRateLimit(client *resty.Client) {
-	rateLimiter := newRateLimiter(true)
-	clientRateLimiters.Store(client, &rateLimiter)
+	rl := &rateLimiter{nonBlocking: true}
+	clientRateLimiters.Store(client, rl)
 
 	client.OnBeforeRequest(func(c *resty.Client, req *resty.Request) error {
 		u, err := url.Parse(req.URL)
 		if err != nil {
 			return err
 		}
-		return rateLimiter.check(req.Context(), u)
+		return rl.check(req.Context(), u)
 	})
 
 	client.OnSuccess(func(c *resty.Client, resp *resty.Response) {
-		rateLimiter.reset(resp.Request.RawRequest.URL, resp)
+		rl.reset(resp.Request.RawRequest.URL, resp)
 	})
 
 	client.OnError(func(req *resty.Request, err error) {
@@ -342,7 +387,7 @@ func EnableRateLimit(client *resty.Client) {
 			resp = v.Response
 		}
 		// Log the error, increment a metric, etc...
-		rateLimiter.reset(req.RawRequest.URL, resp)
+		rl.reset(req.RawRequest.URL, resp)
 	})
 
 	client.AddRetryHook(func(resp *resty.Response, err error) {
@@ -350,7 +395,7 @@ func EnableRateLimit(client *resty.Client) {
 		if resp == nil || resp.Request == nil || resp.Request.RawRequest == nil {
 			return
 		}
-		rateLimiter.reset(resp.Request.RawRequest.URL, resp)
+		rl.reset(resp.Request.RawRequest.URL, resp)
 	})
 }
 

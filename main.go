@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/go-resty/resty/v2"
 	"github.com/gookit/color"
@@ -230,6 +231,8 @@ func main() {
 	var dbg bool
 	var autoFollow bool
 	var noRetry bool
+	var upgradeArg bool
+	var rollbackArg bool
 
 	flag.BoolVar(&confArg, "conf", false, "reconfigure")
 	flag.Var(&usrArgs, "user", "download tweets from the user specified by user_id/screen_name since the last download")
@@ -238,6 +241,8 @@ func main() {
 	flag.BoolVar(&dbg, "dbg", false, "display debug message")
 	flag.BoolVar(&autoFollow, "auto-follow", false, "send follow request automatically to protected users")
 	flag.BoolVar(&noRetry, "no-retry", false, "quickly exit without retrying failed tweets")
+	flag.BoolVar(&upgradeArg, "upgrade", false, "upgrade database and rename existing files")
+	flag.BoolVar(&rollbackArg, "rollback", false, "rollback database and rename files back to their original names")
 	flag.Parse()
 
 	var err error
@@ -350,12 +355,32 @@ func main() {
 	}
 
 	// connect db
-	db, err := connectDatabase(pathHelper.db)
+	db, err := connectDatabase(pathHelper.db, conf.RootPath)
 	if err != nil {
 		log.Fatalln("failed to connect to database:", err)
 	}
 	defer db.Close()
 	log.Infoln("database is connected")
+
+	if rollbackArg {
+		err = downloading.RollbackUpgrade(db)
+		if err != nil {
+			log.Fatalln("rollback failed:", err)
+		}
+		return
+	}
+
+	if upgradeArg {
+		err = backupDatabase(pathHelper.db)
+		if err != nil {
+			log.Fatalln("failed to backup database before upgrade:", err)
+		}
+		err = downloading.UpgradeDatabaseAndFiles(ctx, client, db, conf.RootPath)
+		if err != nil {
+			log.Fatalln("upgrade failed:", err)
+		}
+		return
+	}
 
 	// listen signal
 	sigChan := make(chan os.Signal, 1)
@@ -412,7 +437,7 @@ func setClientLogger(client *resty.Client, out io.Writer) {
 	client.SetLogger(logger)
 }
 
-func connectDatabase(path string) (*sqlx.DB, error) {
+func connectDatabase(path string, rootPath string) (*sqlx.DB, error) {
 	ex, err := utils.PathExists(path)
 	if err != nil {
 		return nil, err
@@ -423,7 +448,11 @@ func connectDatabase(path string) (*sqlx.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	database.CreateTables(db)
+	database.RootPath = rootPath
+	err = database.MigrateDatabase(db, rootPath)
+	if err != nil {
+		return nil, err
+	}
 	//db.SetMaxOpenConns(1)
 	if !ex {
 		log.Debugln("created new db file", path)
@@ -519,7 +548,7 @@ func retryFailedTweets(ctx context.Context, dumper *downloading.TweetDumper, db 
 		toretry = append(toretry, leg)
 	}
 
-	newFails := downloading.BatchDownloadTweet(ctx, client, toretry...)
+	newFails := downloading.BatchDownloadTweet(ctx, client, db, toretry...)
 	dumper.Clear()
 	for _, pt := range newFails {
 		te := pt.(*downloading.TweetInEntity)
@@ -591,4 +620,36 @@ func batchLogin(ctx context.Context, dbg bool, cookies []*Cookie, master string)
 		fmt.Print(msg)
 	}
 	return clients
+}
+
+func backupDatabase(dbPath string) error {
+	ex, err := utils.PathExists(dbPath)
+	if err != nil || !ex {
+		return err
+	}
+
+	timestamp := time.Now().Format("20060102_150405")
+	backupPath := fmt.Sprintf("%s.backup_%s", dbPath, timestamp)
+
+	log.Infof("Creating physical backup of database: %s", backupPath)
+
+	src, err := os.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, src)
+	if err != nil {
+		return err
+	}
+
+	log.Infoln("Database backup completed successfully.")
+	return nil
 }
