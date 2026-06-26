@@ -189,7 +189,16 @@ func makeRateLimit(resp *resty.Response) *xRateLimit {
 
 		if resetTime != "" {
 			if resetTimeNum, err := strconv.ParseInt(resetTime, 10, 64); err == nil {
-				resetTimeTime = time.Unix(resetTimeNum, 0)
+				serverTimeTime, err := http.ParseTime(header.Get("Date"))
+				if err == nil {
+					duration := time.Unix(resetTimeNum, 0).Sub(serverTimeTime)
+					if duration > 0 {
+						resetTimeTime = time.Now().Add(duration)
+					}
+				}
+				if resetTimeTime.IsZero() {
+					resetTimeTime = time.Unix(resetTimeNum, 0)
+				}
 			}
 		}
 		if resetTimeTime.IsZero() {
@@ -231,7 +240,18 @@ func makeRateLimit(resp *resty.Response) *xRateLimit {
 		return nil
 	}
 
-	resetTimeTime := time.Unix(resetTimeNum, 0)
+	var resetTimeTime time.Time
+	serverTimeTime, err := http.ParseTime(header.Get("Date"))
+	if err == nil {
+		duration := time.Unix(resetTimeNum, 0).Sub(serverTimeTime)
+		if duration > 0 {
+			resetTimeTime = time.Now().Add(duration)
+		}
+	}
+	if resetTimeTime.IsZero() {
+		resetTimeTime = time.Unix(resetTimeNum, 0)
+	}
+
 	return &xRateLimit{
 		ResetTime: resetTimeTime,
 		Remaining: remainingNum,
