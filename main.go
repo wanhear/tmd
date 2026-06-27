@@ -375,7 +375,7 @@ func main() {
 		if err != nil {
 			log.Fatalln("failed to backup database before upgrade:", err)
 		}
-		err = downloading.UpgradeDatabaseAndFiles(ctx, client, db, conf.RootPath)
+		err = downloading.UpgradeDatabaseAndFiles(ctx, client, db, conf.RootPath, addtional)
 		if err != nil {
 			log.Fatalln("upgrade failed:", err)
 		}

@@ -921,7 +921,7 @@ type dbWriteTask struct {
 	rawTweet *twitter.Tweet
 }
 
-func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx.DB, rootPath string) error {
+func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx.DB, rootPath string, additional []*resty.Client) error {
 	log.Infoln("Starting full database and filename upgrade...")
 
 	errorJsonPath := filepath.Join(rootPath, ".data", "errors.json")
@@ -930,9 +930,13 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 		log.Warnf("Failed to load existing errors.json: %v", err)
 	}
 
-	// 临时将 RateLimiter 设为阻塞模式，以便在升级中遇到限流时自动 Sleep 等待，而不是报错 EWOULDBLOCK
-	twitter.SetRateLimitBlocking(client, true)
-	defer twitter.SetRateLimitBlocking(client, false)
+	clients := make([]*resty.Client, 0)
+	clients = append(clients, client)
+	clients = append(clients, additional...)
+	for _, cli := range clients {
+		twitter.SetRateLimitBlocking(cli, true)
+		defer twitter.SetRateLimitBlocking(cli, false)
+	}
 
 	// 1. Get total media count for progress bar
 	var totalMedia int
@@ -1081,12 +1085,24 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 				// Fetch their full media timeline with 3 retries on network failure
 				var tweets []*twitter.Tweet
 				for retry := 0; retry < 3; retry++ {
-					tweets, err = twUser.GetMeidas(ctx, client, nil)
+					cli := twitter.SelectUserMediaClient(ctx, clients)
+					if cli == nil {
+						err = fmt.Errorf("no client available")
+						break
+					}
+					tweets, err = twUser.GetMeidas(ctx, cli, nil)
 					if err == nil {
 						break
 					}
 					if ctx.Err() != nil {
 						return
+					}
+					if v, ok := err.(*twitter.TwitterApiError); ok {
+						if v.Code == twitter.ErrExceedPostLimit {
+							twitter.SetClientError(cli, fmt.Errorf("reached the limit for seeing posts today"))
+						} else if v.Code == twitter.ErrAccountLocked {
+							twitter.SetClientError(cli, fmt.Errorf("account is locked"))
+						}
 					}
 					log.Warnf("\n[Retry] Failed to fetch timeline for user %s (%s), retrying (%d/3)... Error: %v", twUser.Name, twUser.ScreenName, retry+1, err)
 					time.Sleep(1500 * time.Millisecond)
