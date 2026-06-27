@@ -933,10 +933,6 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	clients := make([]*resty.Client, 0)
 	clients = append(clients, client)
 	clients = append(clients, additional...)
-	for _, cli := range clients {
-		twitter.SetRateLimitBlocking(cli, true)
-		defer twitter.SetRateLimitBlocking(cli, false)
-	}
 
 	// 1. Get total media count for progress bar
 	var totalMedia int
@@ -1103,6 +1099,12 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 						} else if v.Code == twitter.ErrAccountLocked {
 							twitter.SetClientError(cli, fmt.Errorf("account is locked"))
 						}
+					}
+					if err == twitter.ErrWouldBlock {
+						continue
+					}
+					if v, ok := err.(*utils.HttpStatusError); ok && v.Code == 429 {
+						continue
 					}
 					log.Warnf("\n[Retry] Failed to fetch timeline for user %s (%s), retrying (%d/3)... Error: %v", twUser.Name, twUser.ScreenName, retry+1, err)
 					time.Sleep(1500 * time.Millisecond)
