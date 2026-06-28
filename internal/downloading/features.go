@@ -1106,6 +1106,9 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 					if v, ok := err.(*utils.HttpStatusError); ok && v.Code == 429 {
 						continue
 					}
+					if strings.Contains(err.Error(), "user unavailable") || strings.Contains(err.Error(), "user unavaiable") {
+						break
+					}
 					log.Warnf("\n[Retry] Failed to fetch timeline for user %s (%s), retrying (%d/3)... Error: %v", twUser.Name, twUser.ScreenName, retry+1, err)
 					time.Sleep(1500 * time.Millisecond)
 				}
