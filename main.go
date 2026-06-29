@@ -207,7 +207,7 @@ func newStorePath(root string) (*storePath, error) {
 	return &ph, nil
 }
 
-func initLogger(dbg bool, logFile io.Writer) {
+func initLogger(dbg bool, logFile io.Writer, logKeepFile io.Writer) {
 	log.SetFormatter(&log.TextFormatter{
 		ForceColors:   true,
 		FullTimestamp: true,
@@ -220,6 +220,7 @@ func initLogger(dbg bool, logFile io.Writer) {
 	}
 
 	log.AddHook(lfshook.NewHook(logFile, nil))
+	log.AddHook(lfshook.NewHook(logKeepFile, nil))
 }
 
 func main() {
@@ -264,6 +265,7 @@ func main() {
 	confPath := filepath.Join(appRootPath, "conf.yaml")
 	cliLogPath := filepath.Join(appRootPath, "client.log")
 	logPath := filepath.Join(appRootPath, "tmd2.log")
+	logKeepPath := filepath.Join(appRootPath, "tmd2_KEEP.log")
 	additionalCookiesPath := filepath.Join(appRootPath, "additional_cookies.yaml")
 	if err = os.MkdirAll(appRootPath, 0755); err != nil {
 		log.Fatalln("failed to make app dir", err)
@@ -275,7 +277,14 @@ func main() {
 		log.Fatalln("failed to create log file:", err)
 	}
 	defer logFile.Close()
-	initLogger(dbg, logFile)
+
+	logKeepFile, err := os.OpenFile(logKeepPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		log.Fatalln("failed to create keep log file:", err)
+	}
+	defer logKeepFile.Close()
+
+	initLogger(dbg, logFile, logKeepFile)
 
 	// report at exit
 	defer func() {
