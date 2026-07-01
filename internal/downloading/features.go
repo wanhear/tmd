@@ -929,6 +929,13 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	if err := dumper.Load(errorJsonPath); err != nil {
 		log.Warnf("Failed to load existing errors.json: %v", err)
 	}
+	defer func() {
+		if err := dumper.Dump(errorJsonPath); err != nil {
+			log.Errorf("\nFailed to dump missing files to %s: %v", errorJsonPath, err)
+		} else if dumper.Count() > 0 {
+			log.Infof("Successfully recorded %d pending/missing files to %s", dumper.Count(), errorJsonPath)
+		}
+	}()
 
 	clients := make([]*resty.Client, 0)
 	clients = append(clients, client)
@@ -1354,12 +1361,7 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	// 6. Wait for DB batch writer to commit remaining batches and exit
 	writerWg.Wait()
 
-	// 7. Dump errors to errors.json
-	if err := dumper.Dump(errorJsonPath); err != nil {
-		log.Errorf("\nFailed to dump missing files to %s: %v", errorJsonPath, err)
-	} else if dumper.Count() > 0 {
-		log.Infof("Successfully recorded %d pending/missing files to %s", dumper.Count(), errorJsonPath)
-	}
+
 
 	fmt.Println()
 
