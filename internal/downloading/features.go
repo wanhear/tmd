@@ -1086,6 +1086,33 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 				}
 
 				// Fetch their full media timeline with 3 retries on network failure
+				var totalMediaForUser int
+				err = db.Get(&totalMediaForUser, "SELECT COUNT(*) FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ?", entity.Uid)
+				if err == nil && totalMediaForUser > 0 {
+					var pendingCount int
+					err = db.Get(&pendingCount, "SELECT COUNT(*) FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ? AND mf.download_status != 1", entity.Uid)
+					if err == nil && pendingCount == 0 {
+						var files []struct {
+							Filename string `db:"filename"`
+						}
+						err = db.Select(&files, "SELECT filename FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ?", entity.Uid)
+						if err == nil {
+							allExist := true
+							for _, f := range files {
+								p := filepath.Join(userDir, f.Filename)
+								if ok, _ := utils.PathExists(p); !ok {
+									allExist = false
+									break
+								}
+							}
+							if allExist {
+								atomic.AddInt32(&successUsers, 1)
+								continue
+							}
+						}
+					}
+				}
+
 				var tweets []*twitter.Tweet
 				for retry := 0; retry < 3; retry++ {
 					cli := twitter.SelectUserMediaClient(ctx, clients)
