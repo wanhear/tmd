@@ -1404,32 +1404,41 @@ func RollbackUpgrade(db *sqlx.DB) error {
 	processed := 0
 	drawProgressBar(processed, total)
 
-	for _, l := range logs {
+	const batchSize = 1000
+	for i := 0; i < total; i += batchSize {
+		end := i + batchSize
+		if end > total {
+			end = total
+		}
+		batch := logs[i:end]
+
 		tx, err := db.Beginx()
 		if err != nil {
 			return err
 		}
 
-		newExists, _ := utils.PathExists(l.NewPath)
-		if newExists {
-			err = os.Rename(l.NewPath, l.OldPath)
+		for _, l := range batch {
+			newExists, _ := utils.PathExists(l.NewPath)
+			if newExists {
+				err = os.Rename(l.NewPath, l.OldPath)
+				if err != nil {
+					tx.Rollback()
+					return fmt.Errorf("failed to rename %s back to %s: %v", l.NewPath, l.OldPath, err)
+				}
+			}
+
+			_, err = tx.Exec("DELETE FROM rollback_logs WHERE id = ?", l.Id)
 			if err != nil {
 				tx.Rollback()
-				return fmt.Errorf("failed to rename %s back to %s: %v", l.NewPath, l.OldPath, err)
+				return err
 			}
-		}
 
-		_, err = tx.Exec("DELETE FROM rollback_logs WHERE id = ?", l.Id)
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-
-		filename := filepath.Base(l.NewPath)
-		_, err = tx.Exec("DELETE FROM media_files WHERE filename = ?", filename)
-		if err != nil {
-			tx.Rollback()
-			return err
+			filename := filepath.Base(l.NewPath)
+			_, err = tx.Exec("DELETE FROM media_files WHERE filename = ?", filename)
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
 		}
 
 		err = tx.Commit()
@@ -1437,7 +1446,7 @@ func RollbackUpgrade(db *sqlx.DB) error {
 			return err
 		}
 
-		processed++
+		processed += len(batch)
 		drawProgressBar(processed, total)
 	}
 
