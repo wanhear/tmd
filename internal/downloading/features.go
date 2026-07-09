@@ -1218,6 +1218,9 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 									if f.IsDir() {
 										continue
 									}
+									if isNewFormatName(f.Name()) {
+										continue
+									}
 									if strings.EqualFold(filepath.Ext(f.Name()), ext) {
 										fPath := filepath.Join(userDir, f.Name())
 										if fi, err := os.Stat(fPath); err == nil {
@@ -1441,4 +1444,39 @@ func RollbackUpgrade(db *sqlx.DB) error {
 	fmt.Println()
 	log.Infoln("Rollback completed successfully.")
 	return nil
+}
+
+func isNewFormatName(name string) bool {
+	if len(name) < 30 {
+		return false
+	}
+	for i := 0; i < 8; i++ {
+		if name[i] < '0' || name[i] > '9' {
+			return false
+		}
+	}
+	if name[8] != '_' {
+		return false
+	}
+	secondUnderscore := strings.Index(name[9:], "_")
+	dotIndex := strings.Index(name[9:], ".")
+	idEnd := -1
+	if secondUnderscore != -1 {
+		idEnd = 9 + secondUnderscore
+	} else if dotIndex != -1 {
+		idEnd = 9 + dotIndex
+	}
+	if idEnd == -1 {
+		return false
+	}
+	idStr := name[9:idEnd]
+	if len(idStr) < 18 || len(idStr) > 20 {
+		return false
+	}
+	for i := 0; i < len(idStr); i++ {
+		if idStr[i] < '0' || idStr[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
