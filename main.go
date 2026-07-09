@@ -371,6 +371,18 @@ func main() {
 	defer db.Close()
 	log.Infoln("database is connected")
 
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	defer close(sigChan)
+	defer signal.Stop(sigChan)
+	go func() {
+		sig, ok := <-sigChan
+		if ok {
+			log.Warnln("[listener] caught signal:", sig)
+			cancel()
+		}
+	}()
+
 	if rollbackArg {
 		err = downloading.RollbackUpgrade(db)
 		if err != nil {
@@ -391,18 +403,7 @@ func main() {
 		return
 	}
 
-	// listen signal
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	defer close(sigChan)
-	defer signal.Stop(sigChan)
-	go func() {
-		sig, ok := <-sigChan
-		if ok {
-			log.Warnln("[listener] caught signal:", sig)
-			cancel()
-		}
-	}()
+
 
 	// dump failed tweets at exit
 	var todump = make([]*downloading.TweetInEntity, 0)
