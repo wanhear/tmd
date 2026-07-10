@@ -1431,6 +1431,11 @@ func RollbackUpgrade(db *sqlx.DB) error {
 	processed := 0
 	drawProgressBar(processed, total)
 
+	_, err = db.Exec("CREATE INDEX IF NOT EXISTS idx_media_files_filename ON media_files(filename)")
+	if err != nil {
+		log.Warnf("failed to create index for media_files filename: %v", err)
+	}
+
 	const batchSize = 1000
 	for i := 0; i < total; i += batchSize {
 		end := i + batchSize
@@ -1444,33 +1449,45 @@ func RollbackUpgrade(db *sqlx.DB) error {
 			return err
 		}
 
+		var renamedLogs []database.RollbackLog
+		var iterErr error
+
 		for _, l := range batch {
 			newExists, _ := utils.PathExists(l.NewPath)
 			if newExists {
 				err = os.Rename(l.NewPath, l.OldPath)
 				if err != nil {
-					tx.Rollback()
-					return fmt.Errorf("failed to rename %s back to %s: %v", l.NewPath, l.OldPath, err)
+					iterErr = fmt.Errorf("failed to rename %s back to %s: %v", l.NewPath, l.OldPath, err)
+					break
 				}
+				renamedLogs = append(renamedLogs, l)
 			}
 
 			_, err = tx.Exec("DELETE FROM rollback_logs WHERE id = ?", l.Id)
 			if err != nil {
-				tx.Rollback()
-				return err
+				iterErr = err
+				break
 			}
 
 			filename := filepath.Base(l.NewPath)
 			_, err = tx.Exec("DELETE FROM media_files WHERE filename = ?", filename)
 			if err != nil {
-				tx.Rollback()
-				return err
+				iterErr = err
+				break
 			}
 		}
 
-		err = tx.Commit()
-		if err != nil {
-			return err
+		if iterErr == nil {
+			iterErr = tx.Commit()
+		}
+
+		if iterErr != nil {
+			tx.Rollback()
+			// Revert file renames to maintain consistency with the rolled-back database
+			for _, rl := range renamedLogs {
+				os.Rename(rl.OldPath, rl.NewPath)
+			}
+			return iterErr
 		}
 
 		processed += len(batch)
@@ -1483,7 +1500,7 @@ func RollbackUpgrade(db *sqlx.DB) error {
 }
 
 func isNewFormatName(name string) bool {
-	if len(name) < 30 {
+	if len(name) < 15 {
 		return false
 	}
 	for i := 0; i < 8; i++ {
@@ -1506,7 +1523,7 @@ func isNewFormatName(name string) bool {
 		return false
 	}
 	idStr := name[9:idEnd]
-	if len(idStr) < 18 || len(idStr) > 20 {
+	if len(idStr) < 1 || len(idStr) > 20 {
 		return false
 	}
 	for i := 0; i < len(idStr); i++ {

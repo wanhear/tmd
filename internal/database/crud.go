@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS rollback_logs (
 
 CREATE INDEX IF NOT EXISTS idx_user_links_user_id ON user_links (user_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_tweet_id ON media_files(tweet_id);
+CREATE INDEX IF NOT EXISTS idx_media_files_filename ON media_files(filename);
 `
 
 func CreateTables(db *sqlx.DB) {
