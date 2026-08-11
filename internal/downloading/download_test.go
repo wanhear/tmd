@@ -412,3 +412,30 @@ func TestGenerateFileName(t *testing.T) {
 		t.Errorf("GenerateFileName UTF-8 truncation produced invalid UTF-8 string: %q", cleanTextPart)
 	}
 }
+
+func TestIsNewFormatName(t *testing.T) {
+	valid := []string{
+		"20260619_1803724783284920384_1_Hello World.jpg",
+		"20260619_1803724783284920384_2.png",
+	}
+	for _, name := range valid {
+		if !isNewFormatName(name) {
+			t.Errorf("isNewFormatName(%q) = false, want true", name)
+		}
+	}
+
+	legacy := []string{
+		"20260619_1803724783284920384_Hello World.jpg",
+		"20260619_not-a-tweet_1.jpg",
+		"20261340_1803724783284920384_1.jpg",
+		"20260619_18446744073709551616_1.jpg",
+		"20260619_1803724783284920384_0.jpg",
+		"20260619_1803724783284920384_1.",
+		"Hello World.jpg",
+	}
+	for _, name := range legacy {
+		if isNewFormatName(name) {
+			t.Errorf("isNewFormatName(%q) = true, want false", name)
+		}
+	}
+}

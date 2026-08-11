@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 	"github.com/go-resty/resty/v2"
 	"github.com/gookit/color"
 	"github.com/jmoiron/sqlx"
+	"github.com/mattn/go-sqlite3"
 	"github.com/rifflock/lfshook"
 	log "github.com/sirupsen/logrus"
 	"github.com/unkmonster/tmd/internal/database"
@@ -243,13 +245,18 @@ func main() {
 	flag.BoolVar(&autoFollow, "auto-follow", false, "send follow request automatically to protected users")
 	flag.BoolVar(&noRetry, "no-retry", false, "quickly exit without retrying failed tweets")
 	flag.BoolVar(&upgradeArg, "upgrade", false, "upgrade database and rename existing files")
-	flag.BoolVar(&rollbackArg, "rollback", false, "rollback database and rename files back to their original names")
+	flag.BoolVar(&rollbackArg, "rollback", false, "restore file renames recorded by upgrade and clear upgrade completion state")
 	flag.Parse()
+	if upgradeArg && rollbackArg {
+		fmt.Fprintln(os.Stderr, "-upgrade and -rollback cannot be used together")
+		os.Exit(2)
+	}
 
 	var err error
 
 	// context
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	var homepath string
 	if runtime.GOOS == "windows" {
@@ -286,6 +293,17 @@ func main() {
 
 	initLogger(dbg, logFile, logKeepFile)
 
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	defer signal.Stop(sigChan)
+	go func() {
+		sig, ok := <-sigChan
+		if ok {
+			log.Warnln("[listener] caught signal:", sig)
+			cancel()
+		}
+	}()
+
 	// report at exit
 	defer func() {
 		if dbg {
@@ -319,6 +337,30 @@ func main() {
 		log.Fatalln("failed to make store dir:", err)
 	}
 
+	if rollbackArg {
+		if err := backupDatabase(ctx, pathHelper.db); err != nil {
+			log.Fatalln("failed to backup database before rollback:", err)
+		}
+
+		db, err := connectDatabase(pathHelper.db, conf.RootPath, false)
+		if err != nil {
+			log.Fatalln("failed to connect to database:", err)
+		}
+		defer db.Close()
+		log.Infoln("database is connected")
+
+		if err := downloading.RollbackUpgrade(ctx, db); err != nil {
+			log.Fatalln("rollback failed:", err)
+		}
+		return
+	}
+
+	if upgradeArg {
+		if err := backupDatabase(ctx, pathHelper.db); err != nil {
+			log.Fatalln("failed to backup database before upgrade:", err)
+		}
+	}
+
 	// sign in
 	client, screenName, err := twitter.Login(ctx, conf.Cookie.AuthCoken, conf.Cookie.Ct0)
 	if err != nil {
@@ -349,6 +391,20 @@ func main() {
 		setClientLogger(cli, cliLogFile)
 	}
 
+	if upgradeArg {
+		db, err := connectDatabase(pathHelper.db, conf.RootPath, true)
+		if err != nil {
+			log.Fatalln("failed to connect to database:", err)
+		}
+		defer db.Close()
+		log.Infoln("database is connected")
+
+		if err := downloading.UpgradeDatabaseAndFiles(ctx, client, db, conf.RootPath, addtional); err != nil {
+			log.Fatalln("upgrade failed:", err)
+		}
+		return
+	}
+
 	// load previous tweets
 	dumper := downloading.NewDumper()
 	err = dumper.Load(pathHelper.errorj)
@@ -364,46 +420,12 @@ func main() {
 	}
 
 	// connect db
-	db, err := connectDatabase(pathHelper.db, conf.RootPath)
+	db, err := connectDatabase(pathHelper.db, conf.RootPath, true)
 	if err != nil {
 		log.Fatalln("failed to connect to database:", err)
 	}
 	defer db.Close()
 	log.Infoln("database is connected")
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	defer close(sigChan)
-	defer signal.Stop(sigChan)
-	go func() {
-		sig, ok := <-sigChan
-		if ok {
-			log.Warnln("[listener] caught signal:", sig)
-			cancel()
-		}
-	}()
-
-	if rollbackArg {
-		err = downloading.RollbackUpgrade(db)
-		if err != nil {
-			log.Fatalln("rollback failed:", err)
-		}
-		return
-	}
-
-	if upgradeArg {
-		err = backupDatabase(pathHelper.db)
-		if err != nil {
-			log.Fatalln("failed to backup database before upgrade:", err)
-		}
-		err = downloading.UpgradeDatabaseAndFiles(ctx, client, db, conf.RootPath, addtional)
-		if err != nil {
-			log.Fatalln("upgrade failed:", err)
-		}
-		return
-	}
-
-
 
 	// dump failed tweets at exit
 	var todump = make([]*downloading.TweetInEntity, 0)
@@ -447,10 +469,13 @@ func setClientLogger(client *resty.Client, out io.Writer) {
 	client.SetLogger(logger)
 }
 
-func connectDatabase(path string, rootPath string) (*sqlx.DB, error) {
+func connectDatabase(path string, rootPath string, migrate bool) (*sqlx.DB, error) {
 	ex, err := utils.PathExists(path)
 	if err != nil {
 		return nil, err
+	}
+	if !ex && !migrate {
+		return nil, fmt.Errorf("database does not exist: %s", path)
 	}
 
 	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&busy_timeout=2147483647", path)
@@ -459,9 +484,11 @@ func connectDatabase(path string, rootPath string) (*sqlx.DB, error) {
 		return nil, err
 	}
 	database.RootPath = rootPath
-	err = database.MigrateDatabase(db, rootPath)
-	if err != nil {
-		return nil, err
+	if migrate {
+		if err := database.MigrateDatabase(db, rootPath); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	//db.SetMaxOpenConns(1)
 	if !ex {
@@ -604,13 +631,12 @@ func batchLogin(ctx context.Context, dbg bool, cookies []*Cookie, master string)
 		go func(index int) {
 			defer wg.Done()
 			cli, sn, err := twitter.Login(ctx, cookie.AuthCoken, cookie.Ct0)
-			if _, loaded := added.LoadOrStore(sn, struct{}{}); loaded {
-				msgs[index] = "    - ? repeated\n"
-				return
-			}
-
 			if err != nil {
 				msgs[index] = fmt.Sprintf("    - ? %v\n", err)
+				return
+			}
+			if _, loaded := added.LoadOrStore(sn, struct{}{}); loaded {
+				msgs[index] = "    - ? repeated\n"
 				return
 			}
 			twitter.EnableRateLimit(cli)
@@ -632,34 +658,113 @@ func batchLogin(ctx context.Context, dbg bool, cookies []*Cookie, master string)
 	return clients
 }
 
-func backupDatabase(dbPath string) error {
+func backupDatabase(ctx context.Context, dbPath string) error {
 	ex, err := utils.PathExists(dbPath)
-	if err != nil || !ex {
+	if err != nil {
 		return err
 	}
+	if !ex {
+		log.Infoln("Database does not exist yet; no pre-upgrade backup is needed.")
+		return nil
+	}
 
-	timestamp := time.Now().Format("20060102_150405")
+	timestamp := time.Now().Format("20060102_150405.000000000")
 	backupPath := fmt.Sprintf("%s.backup_%s", dbPath, timestamp)
 
-	log.Infof("Creating physical backup of database: %s", backupPath)
-
-	src, err := os.Open(dbPath)
+	placeholder, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return err
 	}
-	defer src.Close()
-
-	dst, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-
-	_, err = io.Copy(dst, src)
-	if err != nil {
+	if err := placeholder.Close(); err != nil {
+		os.Remove(backupPath)
 		return err
 	}
 
-	log.Infoln("Database backup completed successfully.")
+	backupComplete := false
+	defer func() {
+		if !backupComplete {
+			if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+				log.Warnf("failed to remove incomplete database backup %s: %v", backupPath, err)
+			}
+		}
+	}()
+
+	log.Infof("Creating SQLite online backup: %s", backupPath)
+
+	sourceDsn := fmt.Sprintf("file:%s?mode=ro&_busy_timeout=60000", filepath.ToSlash(dbPath))
+	sourceDb, err := sql.Open("sqlite3", sourceDsn)
+	if err != nil {
+		return err
+	}
+	defer sourceDb.Close()
+	sourceDb.SetMaxOpenConns(1)
+
+	destinationDb, err := sql.Open("sqlite3", backupPath)
+	if err != nil {
+		return err
+	}
+	defer destinationDb.Close()
+	destinationDb.SetMaxOpenConns(1)
+
+	sourceConn, err := sourceDb.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	destinationConn, err := destinationDb.Conn(ctx)
+	if err != nil {
+		sourceConn.Close()
+		return err
+	}
+
+	err = sourceConn.Raw(func(sourceDriverConn any) error {
+		sourceSqliteConn, ok := sourceDriverConn.(*sqlite3.SQLiteConn)
+		if !ok {
+			return fmt.Errorf("unexpected source SQLite driver connection type %T", sourceDriverConn)
+		}
+		return destinationConn.Raw(func(destinationDriverConn any) error {
+			destinationSqliteConn, ok := destinationDriverConn.(*sqlite3.SQLiteConn)
+			if !ok {
+				return fmt.Errorf("unexpected destination SQLite driver connection type %T", destinationDriverConn)
+			}
+
+			backup, err := destinationSqliteConn.Backup("main", sourceSqliteConn, "main")
+			if err != nil {
+				return err
+			}
+
+			for {
+				done, stepErr := backup.Step(2048)
+				if stepErr != nil {
+					backup.Finish()
+					return stepErr
+				}
+				if done {
+					return backup.Finish()
+				}
+				select {
+				case <-ctx.Done():
+					backup.Finish()
+					return ctx.Err()
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+		})
+	})
+	destinationConn.Close()
+	sourceConn.Close()
+	if err != nil {
+		return err
+	}
+
+	var integrity string
+	if err := destinationDb.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&integrity); err != nil {
+		return fmt.Errorf("failed to verify database backup: %w", err)
+	}
+	if integrity != "ok" {
+		return fmt.Errorf("database backup integrity check failed: %s", integrity)
+	}
+
+	backupComplete = true
+	log.Infoln("Database backup completed and verified successfully.")
 	return nil
 }

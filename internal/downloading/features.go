@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,22 @@ func (pt TweetInDir) GetPath() string {
 // 任何一个 url 下载失败直接返回
 // TODO: 要么全做，要么不做
 func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, dir string, tweet *twitter.Tweet) error {
+	saveMediaRecord := func(media *database.MediaFileRecord) error {
+		if db == nil {
+			return nil
+		}
+		dbTweet := &database.TweetRecord{
+			Id:        tweet.Id,
+			UserId:    tweet.Creator.Id,
+			Text:      tweet.Text,
+			CreatedAt: tweet.CreatedAt,
+		}
+		if err := database.SaveTweet(db, dbTweet); err != nil {
+			return err
+		}
+		return database.SaveMediaFile(db, media)
+	}
+
 	for i, u := range tweet.Urls {
 		ext, err := utils.GetExtFromUrl(u)
 		if err != nil {
@@ -60,9 +77,13 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 		// 1. Check DB first if db is available
 		if db != nil {
 			mf, err := database.GetMediaFile(db, tweet.Id, u)
-			if err == nil && mf != nil && mf.DownloadStatus == 1 {
+			if err != nil {
+				return err
+			}
+			if mf != nil && mf.DownloadStatus == 1 {
 				// Verify if file actually exists on disk
-				if exists, _ := utils.PathExists(path); exists {
+				storedPath := filepath.Join(dir, mf.Filename)
+				if exists, _ := utils.PathExists(storedPath); exists {
 					continue // Already downloaded, skip completely
 				}
 			}
@@ -72,14 +93,6 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 		if exists, _ := utils.PathExists(path); exists {
 			// Write DB record for consistency
 			if db != nil {
-				dbTweet := &database.TweetRecord{
-					Id:        tweet.Id,
-					UserId:    tweet.Creator.Id,
-					Text:      tweet.Text,
-					CreatedAt: tweet.CreatedAt,
-				}
-				database.SaveTweet(db, dbTweet)
-
 				dbMedia := &database.MediaFileRecord{
 					TweetId:          tweet.Id,
 					Url:              u,
@@ -91,7 +104,9 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 				if fi, err := os.Stat(path); err == nil {
 					dbMedia.FileSize = sql.NullInt64{Int64: fi.Size(), Valid: true}
 				}
-				database.SaveMediaFile(db, dbMedia)
+				if err := saveMediaRecord(dbMedia); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -112,14 +127,6 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 			if err == nil {
 				log.Infof("Migrated file %s to %s on-the-fly", oldName, truncatedName)
 				if db != nil {
-					dbTweet := &database.TweetRecord{
-						Id:        tweet.Id,
-						UserId:    tweet.Creator.Id,
-						Text:      tweet.Text,
-						CreatedAt: tweet.CreatedAt,
-					}
-					database.SaveTweet(db, dbTweet)
-
 					dbMedia := &database.MediaFileRecord{
 						TweetId:          tweet.Id,
 						Url:              u,
@@ -131,7 +138,12 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 					if fi, err := os.Stat(path); err == nil {
 						dbMedia.FileSize = sql.NullInt64{Int64: fi.Size(), Valid: true}
 					}
-					database.SaveMediaFile(db, dbMedia)
+					if err := saveMediaRecord(dbMedia); err != nil {
+						if renameErr := os.Rename(path, oldPath); renameErr != nil {
+							return fmt.Errorf("failed to save migrated media record: %v; failed to restore %s: %w", err, oldPath, renameErr)
+						}
+						return err
+					}
 				}
 				continue
 			}
@@ -148,7 +160,9 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 					OriginalFilename: originalName,
 					DownloadStatus:   2, // failed
 				}
-				database.SaveMediaFile(db, dbMedia)
+				if recordErr := saveMediaRecord(dbMedia); recordErr != nil {
+					return fmt.Errorf("download failed (%v) and failure status could not be saved: %w", err, recordErr)
+				}
 			}
 			return err
 		}
@@ -168,14 +182,6 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 
 		// Record success to DB
 		if db != nil {
-			dbTweet := &database.TweetRecord{
-				Id:        tweet.Id,
-				UserId:    tweet.Creator.Id,
-				Text:      tweet.Text,
-				CreatedAt: tweet.CreatedAt,
-			}
-			database.SaveTweet(db, dbTweet)
-
 			dbMedia := &database.MediaFileRecord{
 				TweetId:          tweet.Id,
 				Url:              u,
@@ -185,7 +191,9 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 				DownloadedAt:     sql.NullTime{Time: time.Now(), Valid: true},
 				FileSize:         sql.NullInt64{Int64: int64(len(resp.Body())), Valid: true},
 			}
-			database.SaveMediaFile(db, dbMedia)
+			if err := saveMediaRecord(dbMedia); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -603,7 +611,13 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		defer panicHandler()
 
 		user := uidToUser[entity.Uid()]
-		cli := twitter.SelectUserMediaClient(ctx, clients)
+		// Follow state is relative to the primary authenticated account that
+		// supplied these user records. An additional account may not have
+		// permission to read the same protected timeline.
+		cli := client
+		if !user.IsProtected {
+			cli = twitter.SelectUserMediaClient(ctx, clients)
+		}
 		if ctx.Err() != nil {
 			userEntityHeap.Push(entity)
 			return
@@ -917,12 +931,28 @@ type dbWriteTask struct {
 	tweet    *database.TweetRecord
 	media    *database.MediaFileRecord
 	log      *database.RollbackLog
+	rename   *fileRename
+	complete *upgradeCompletion
 	entityId int
 	rawTweet *twitter.Tweet
 }
 
+type fileRename struct {
+	oldPath string
+	newPath string
+}
+
+type upgradeCompletion struct {
+	userId      uint64
+	userDir     string
+	completedAt time.Time
+}
+
 func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx.DB, rootPath string, additional []*resty.Client) error {
 	log.Infoln("Starting full database and filename upgrade...")
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	errorJsonPath := filepath.Join(rootPath, ".data", "errors.json")
 	dumper := NewDumper()
@@ -962,6 +992,35 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 		return fmt.Errorf("failed to query user entities: %v", err)
 	}
 
+	resolveUserDir := func(entity TempUserEntity) string {
+		if filepath.IsAbs(entity.ParentDir) {
+			return filepath.Clean(filepath.Join(entity.ParentDir, entity.Name))
+		}
+		return filepath.Clean(filepath.Join(rootPath, entity.ParentDir, entity.Name))
+	}
+
+	// Old absolute paths and migrated relative paths may describe the same
+	// physical directory. Process each user/directory pair only once.
+	uniqueEntities := make([]TempUserEntity, 0, len(entities))
+	seenEntities := make(map[string]struct{}, len(entities))
+	for _, entity := range entities {
+		userDir := resolveUserDir(entity)
+		keyPath := userDir
+		if runtime.GOOS == "windows" {
+			keyPath = strings.ToLower(keyPath)
+		}
+		key := fmt.Sprintf("%d\x00%s", entity.Uid, keyPath)
+		if _, exists := seenEntities[key]; exists {
+			continue
+		}
+		seenEntities[key] = struct{}{}
+		uniqueEntities = append(uniqueEntities, entity)
+	}
+	if duplicates := len(entities) - len(uniqueEntities); duplicates > 0 {
+		log.Warnf("Ignored %d duplicate user entities that resolve to the same directory.", duplicates)
+	}
+	entities = uniqueEntities
+
 	var initialProcessed int
 	err = db.Get(&initialProcessed, "SELECT COUNT(*) FROM media_files WHERE download_status = 1")
 	if err != nil {
@@ -971,11 +1030,18 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	var successUsers int32
 	var failedUsers int32
 	var missingFiles int32
-	drawProgressBar(int(processedCounter), totalMedia)
+	var progressMtx sync.Mutex
+	drawUpgradeProgress := func() {
+		progressMtx.Lock()
+		defer progressMtx.Unlock()
+		drawProgressBar(int(atomic.LoadInt32(&processedCounter)), totalMedia)
+	}
+	drawUpgradeProgress()
 
 	// 3. Start DB batch writer goroutine
 	dbWriteChan := make(chan dbWriteTask, 5000)
 	var writerWg sync.WaitGroup
+	var writerErr error
 	writerWg.Add(1)
 
 	go func() {
@@ -984,43 +1050,118 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 		const batchSize = 1000
 		var batch []dbWriteTask
 
-		commitBatch := func() {
+		commitBatch := func() error {
 			if len(batch) == 0 {
-				return
+				return nil
 			}
 			tx, err := db.Beginx()
 			if err != nil {
-				log.Errorf("\nFailed to begin transaction: %v", err)
-				return
+				return fmt.Errorf("failed to begin upgrade transaction: %w", err)
 			}
+			defer tx.Rollback()
+
 			for _, task := range batch {
 				if task.log != nil {
-					_, err = tx.Exec("INSERT INTO rollback_logs(old_path, new_path, migrated_at) VALUES(?, ?, ?)", task.log.OldPath, task.log.NewPath, task.log.MigratedAt)
+					_, err = tx.Exec(
+						`INSERT INTO rollback_logs(old_path, new_path, migrated_at)
+						 SELECT ?, ?, ?
+						 WHERE NOT EXISTS (
+							SELECT 1 FROM rollback_logs
+							WHERE old_path = ? AND new_path = ?
+						 )`,
+						task.log.OldPath,
+						task.log.NewPath,
+						task.log.MigratedAt,
+						task.log.OldPath,
+						task.log.NewPath,
+					)
 					if err != nil {
-						log.Errorf("\nFailed to save rollback log: %v", err)
+						return fmt.Errorf("failed to save rollback log: %w", err)
 					}
 				}
 				if task.tweet != nil {
 					err = database.SaveTweetTx(tx, task.tweet)
 					if err != nil {
-						log.Errorf("\nFailed to save tweet: %v", err)
+						return fmt.Errorf("failed to save tweet: %w", err)
 					}
 				}
 				if task.media != nil {
 					err = database.SaveMediaFileTx(tx, task.media)
 					if err != nil {
-						log.Errorf("\nFailed to save media file: %v", err)
+						return fmt.Errorf("failed to save media file: %w", err)
 					}
 				}
+			}
+
+			if err = tx.Commit(); err != nil {
+				return fmt.Errorf("failed to commit upgrade transaction: %w", err)
+			}
+
+			// Rollback intent is durable before any filesystem mutation.
+			for _, task := range batch {
+				if task.rename == nil {
+					continue
+				}
+
+				oldExists, err := utils.PathExists(task.rename.oldPath)
+				if err != nil {
+					return fmt.Errorf("failed to inspect old migration path %s: %w", task.rename.oldPath, err)
+				}
+				newExists, err := utils.PathExists(task.rename.newPath)
+				if err != nil {
+					return fmt.Errorf("failed to inspect new migration path %s: %w", task.rename.newPath, err)
+				}
+
+				switch {
+				case oldExists && !newExists:
+					if err := os.Rename(task.rename.oldPath, task.rename.newPath); err != nil {
+						return fmt.Errorf("failed to rename %s to %s: %w", task.rename.oldPath, task.rename.newPath, err)
+					}
+				case !oldExists && newExists:
+					// A previous interrupted run already completed this rename.
+				case oldExists && newExists:
+					return fmt.Errorf("refusing to overwrite existing migration target %s", task.rename.newPath)
+				default:
+					log.Warnf("file missing from disk, skipping rename: %s", task.rename.newPath)
+				}
+			}
+
+			var completions []*upgradeCompletion
+			for _, task := range batch {
+				if task.complete != nil {
+					completions = append(completions, task.complete)
+				}
+			}
+			if len(completions) > 0 {
+				completionTx, err := db.Beginx()
+				if err != nil {
+					return fmt.Errorf("failed to begin upgrade completion transaction: %w", err)
+				}
+				defer completionTx.Rollback()
+
+				for _, completion := range completions {
+					_, err = completionTx.Exec(
+						`INSERT OR REPLACE INTO upgrade_user_states(user_id, user_dir, completed_at) VALUES(?, ?, ?)`,
+						completion.userId,
+						completion.userDir,
+						completion.completedAt,
+					)
+					if err != nil {
+						return fmt.Errorf("failed to mark user upgrade complete: %w", err)
+					}
+				}
+				if err = completionTx.Commit(); err != nil {
+					return fmt.Errorf("failed to commit upgrade completion transaction: %w", err)
+				}
+			}
+
+			for _, task := range batch {
 				if task.rawTweet != nil && task.entityId != 0 {
 					dumper.Push(task.entityId, task.rawTweet)
 				}
 			}
-			err = tx.Commit()
-			if err != nil {
-				log.Errorf("\nFailed to commit transaction: %v", err)
-			}
 			batch = nil
+			return nil
 		}
 
 		ticker := time.NewTicker(100 * time.Millisecond)
@@ -1030,15 +1171,26 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 			select {
 			case task, ok := <-dbWriteChan:
 				if !ok {
-					commitBatch()
+					if err := commitBatch(); err != nil {
+						writerErr = err
+						cancel()
+					}
 					return
 				}
 				batch = append(batch, task)
 				if len(batch) >= batchSize {
-					commitBatch()
+					if err := commitBatch(); err != nil {
+						writerErr = err
+						cancel()
+						return
+					}
 				}
 			case <-ticker.C:
-				commitBatch()
+				if err := commitBatch(); err != nil {
+					writerErr = err
+					cancel()
+					return
+				}
 			}
 		}
 	}()
@@ -1062,18 +1214,13 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 					return
 				}
 
-				// Reconstruct the user dir
-				var userDir string
-				if filepath.IsAbs(entity.ParentDir) {
-					userDir = filepath.Join(entity.ParentDir, entity.Name)
-				} else {
-					userDir = filepath.Join(rootPath, entity.ParentDir, entity.Name)
-				}
+				userDir := resolveUserDir(entity)
 
 				// Get the user info from db to reconstruct twitter.User
 				var user database.User
-				err = db.Get(&user, "SELECT * FROM users WHERE id = ?", entity.Uid)
-				if err != nil {
+				if entityErr := db.Get(&user, "SELECT * FROM users WHERE id = ?", entity.Uid); entityErr != nil {
+					atomic.AddInt32(&failedUsers, 1)
+					log.Errorf("\n[Error] Failed to load user %d from database: %v", entity.Uid, entityErr)
 					continue
 				}
 
@@ -1083,20 +1230,39 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 					ScreenName:   user.ScreenName,
 					IsProtected:  user.IsProtected,
 					FriendsCount: user.FriendsCount,
+					// The database does not persist follow state. Force an
+					// actual request and let the API decide whether each
+					// authenticated account may see a protected timeline.
+					Followstate: twitter.FS_FOLLOWING,
 				}
 
-				// Fetch their full media timeline with 3 retries on network failure
-				var totalMediaForUser int
-				err = db.Get(&totalMediaForUser, "SELECT COUNT(*) FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ?", entity.Uid)
-				if err == nil && totalMediaForUser > 0 {
+				// Only a durable completion marker may authorize the fast path.
+				// Existing media rows alone cannot prove that a previous run
+				// finished processing the user's complete visible timeline.
+				var upgradeCompleted int
+				entityErr := db.Get(
+					&upgradeCompleted,
+					`SELECT EXISTS(
+						SELECT 1 FROM upgrade_user_states
+						WHERE user_id = ? AND user_dir = ?
+					)`,
+					entity.Uid,
+					userDir,
+				)
+				if entityErr != nil {
+					atomic.AddInt32(&failedUsers, 1)
+					log.Errorf("\n[Error] Failed to read upgrade state for user %s (%s): %v", twUser.Name, twUser.ScreenName, entityErr)
+					continue
+				}
+				if upgradeCompleted != 0 {
 					var pendingCount int
-					err = db.Get(&pendingCount, "SELECT COUNT(*) FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ? AND mf.download_status != 1", entity.Uid)
-					if err == nil && pendingCount == 0 {
+					entityErr = db.Get(&pendingCount, "SELECT COUNT(*) FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ? AND mf.download_status != 1", entity.Uid)
+					if entityErr == nil && pendingCount == 0 {
 						var files []struct {
 							Filename string `db:"filename"`
 						}
-						err = db.Select(&files, "SELECT filename FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ?", entity.Uid)
-						if err == nil {
+						entityErr = db.Select(&files, "SELECT filename FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ?", entity.Uid)
+						if entityErr == nil {
 							allExist := true
 							for _, f := range files {
 								p := filepath.Join(userDir, f.Filename)
@@ -1111,49 +1277,90 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 							}
 						}
 					}
+					if entityErr != nil {
+						atomic.AddInt32(&failedUsers, 1)
+						log.Errorf("\n[Error] Failed to validate completed upgrade for user %s (%s): %v", twUser.Name, twUser.ScreenName, entityErr)
+						continue
+					}
 				}
 
 				var tweets []*twitter.Tweet
-				for retry := 0; retry < 3; retry++ {
-					cli := twitter.SelectUserMediaClient(ctx, clients)
-					if cli == nil {
-						err = fmt.Errorf("no client available")
-						break
-					}
-					tweets, err = twUser.GetMeidas(ctx, cli, nil)
-					if err == nil {
-						break
-					}
-					if ctx.Err() != nil {
-						return
-					}
-					if v, ok := err.(*twitter.TwitterApiError); ok {
-						if v.Code == twitter.ErrExceedPostLimit {
-							twitter.SetClientError(cli, fmt.Errorf("reached the limit for seeing posts today"))
-						} else if v.Code == twitter.ErrAccountLocked {
-							twitter.SetClientError(cli, fmt.Errorf("account is locked"))
+				var fetchErr error
+				if len(clients) == 0 {
+					fetchErr = fmt.Errorf("no client available")
+				} else {
+					startClient := int(entity.Uid % uint64(len(clients)))
+					for retry := 0; retry < 3; retry++ {
+						fetchErr = fmt.Errorf("no client could fetch the timeline")
+						attemptedClient := false
+						allWouldBlock := true
+						for offset := 0; offset < len(clients); offset++ {
+							cli := clients[(startClient+retry+offset)%len(clients)]
+							if cli == nil || twitter.GetClientError(cli) != nil {
+								continue
+							}
+							attemptedClient = true
+
+							tweets, fetchErr = twUser.GetMeidas(ctx, cli, nil)
+							if fetchErr == nil {
+								allWouldBlock = false
+								break
+							}
+							if ctx.Err() != nil {
+								return
+							}
+
+							if v, ok := fetchErr.(*twitter.TwitterApiError); ok {
+								if v.Code == twitter.ErrExceedPostLimit {
+									twitter.SetClientError(cli, fmt.Errorf("reached the limit for seeing posts today"))
+								} else if v.Code == twitter.ErrAccountLocked {
+									twitter.SetClientError(cli, fmt.Errorf("account is locked"))
+								}
+							}
+
+							if errors.Is(fetchErr, twitter.ErrWouldBlock) {
+								continue
+							}
+							allWouldBlock = false
+
+							if errors.Is(fetchErr, twitter.ErrTimelineUnavailable) {
+								continue
+							}
+							if v, ok := fetchErr.(*utils.HttpStatusError); ok && v.Code == 429 {
+								continue
+							}
+							if strings.Contains(fetchErr.Error(), "user unavailable") ||
+								strings.Contains(fetchErr.Error(), "user unavaiable") {
+								continue
+							}
+						}
+
+						if fetchErr == nil || !attemptedClient {
+							break
+						}
+						if allWouldBlock {
+							if twitter.SelectUserMediaClient(ctx, clients) == nil {
+								break
+							}
+							retry--
+							continue
+						}
+						log.Warnf("\n[Retry] Failed to fetch timeline for user %s (%s), retrying (%d/3)... Error: %v", twUser.Name, twUser.ScreenName, retry+1, fetchErr)
+						select {
+						case <-time.After(1500 * time.Millisecond):
+						case <-ctx.Done():
+							return
 						}
 					}
-					if err == twitter.ErrWouldBlock {
-						continue
-					}
-					if v, ok := err.(*utils.HttpStatusError); ok && v.Code == 429 {
-						continue
-					}
-					if strings.Contains(err.Error(), "user unavailable") || strings.Contains(err.Error(), "user unavaiable") {
-						break
-					}
-					log.Warnf("\n[Retry] Failed to fetch timeline for user %s (%s), retrying (%d/3)... Error: %v", twUser.Name, twUser.ScreenName, retry+1, err)
-					time.Sleep(1500 * time.Millisecond)
 				}
 
-				if err != nil {
+				if fetchErr != nil {
 					atomic.AddInt32(&failedUsers, 1)
-					log.Errorf("\n[Error] Failed to fetch timeline for user %s (%s) after 3 retries: %v", twUser.Name, twUser.ScreenName, err)
+					log.Errorf("\n[Error] Failed to fetch timeline for user %s (%s) after 3 retries: %v", twUser.Name, twUser.ScreenName, fetchErr)
 					continue
 				}
-				atomic.AddInt32(&successUsers, 1)
 
+				entityComplete := true
 				for _, tweet := range tweets {
 					if ctx.Err() != nil {
 						return
@@ -1161,8 +1368,10 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 					tweet.Creator = twUser
 
 					for i, u := range tweet.Urls {
-						ext, err := utils.GetExtFromUrl(u)
-						if err != nil {
+						ext, mediaErr := utils.GetExtFromUrl(u)
+						if mediaErr != nil {
+							entityComplete = false
+							log.Errorf("\nFailed to determine media extension for tweet %d: %v", tweet.Id, mediaErr)
 							continue
 						}
 
@@ -1171,9 +1380,15 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 						newPath := filepath.Join(userDir, truncatedName)
 
 						// Check if the record already exists in the database
-						mf, err := database.GetMediaFile(db, tweet.Id, u)
-						if err == nil && mf != nil && mf.DownloadStatus == 1 {
-							if exists, _ := utils.PathExists(newPath); exists {
+						mf, mediaErr := database.GetMediaFile(db, tweet.Id, u)
+						if mediaErr != nil {
+							entityComplete = false
+							log.Errorf("\nFailed to query media record for tweet %d: %v", tweet.Id, mediaErr)
+							continue
+						}
+						if mf != nil && mf.DownloadStatus == 1 {
+							storedPath := filepath.Join(userDir, mf.Filename)
+							if exists, _ := utils.PathExists(storedPath); exists {
 								continue
 							}
 						}
@@ -1207,7 +1422,7 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 							}
 
 							atomic.AddInt32(&processedCounter, 1)
-							drawProgressBar(int(atomic.LoadInt32(&processedCounter)), totalMedia)
+							drawUpgradeProgress()
 							continue
 						}
 
@@ -1333,16 +1548,14 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 								MigratedAt: time.Now(),
 							}
 
-							err = os.Rename(matchedOldPath, newPath)
-							if err != nil {
-								log.Errorf("\nFailed to rename %s to %s: %v", matchedOldPath, newPath, err)
-								continue
-							}
-
 							select {
-							case dbWriteChan <- dbWriteTask{tweet: dbTweet, media: dbMedia, log: dbLog}:
+							case dbWriteChan <- dbWriteTask{
+								tweet:  dbTweet,
+								media:  dbMedia,
+								log:    dbLog,
+								rename: &fileRename{oldPath: matchedOldPath, newPath: newPath},
+							}:
 							case <-ctx.Done():
-								os.Rename(newPath, matchedOldPath) // revert rename on context cancel
 								return
 							}
 						} else {
@@ -1377,8 +1590,27 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 						}
 
 						atomic.AddInt32(&processedCounter, 1)
-						drawProgressBar(int(atomic.LoadInt32(&processedCounter)), totalMedia)
+						drawUpgradeProgress()
 					}
+				}
+
+				if !entityComplete {
+					atomic.AddInt32(&failedUsers, 1)
+					log.Errorf("\n[Error] User %s (%s) was not marked complete because one or more media items could not be processed.", twUser.Name, twUser.ScreenName)
+					continue
+				}
+
+				select {
+				case dbWriteChan <- dbWriteTask{
+					complete: &upgradeCompletion{
+						userId:      entity.Uid,
+						userDir:     userDir,
+						completedAt: time.Now(),
+					},
+				}:
+					atomic.AddInt32(&successUsers, 1)
+				case <-ctx.Done():
+					return
 				}
 			}
 		}()
@@ -1391,9 +1623,14 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	// 6. Wait for DB batch writer to commit remaining batches and exit
 	writerWg.Wait()
 
-
-
 	fmt.Println()
+
+	if writerErr != nil {
+		return fmt.Errorf("upgrade database writer failed: %w", writerErr)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	totalUsers := len(entities)
 	failedCount := atomic.LoadInt32(&failedUsers)
@@ -1403,8 +1640,7 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	}
 
 	if failedCount > 0 {
-		log.Warnf("Upgrade completed with warnings: %d/%d users failed to process due to timeline fetching errors. Run '--upgrade' again to retry.", failedCount, totalUsers)
-		return nil
+		return fmt.Errorf("upgrade incomplete: %d/%d users failed to process; run '--upgrade' again to retry", failedCount, totalUsers)
 	}
 
 	missingCount := atomic.LoadInt32(&missingFiles)
@@ -1416,8 +1652,8 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	return nil
 }
 
-func RollbackUpgrade(db *sqlx.DB) error {
-	log.Infoln("Starting database and filename rollback...")
+func RollbackUpgrade(ctx context.Context, db *sqlx.DB) error {
+	log.Infoln("Starting recorded filename rollback...")
 
 	var logs []database.RollbackLog
 	err := db.Select(&logs, "SELECT * FROM rollback_logs ORDER BY id DESC")
@@ -1453,14 +1689,38 @@ func RollbackUpgrade(db *sqlx.DB) error {
 		var iterErr error
 
 		for _, l := range batch {
-			newExists, _ := utils.PathExists(l.NewPath)
-			if newExists {
-				err = os.Rename(l.NewPath, l.OldPath)
-				if err != nil {
-					iterErr = fmt.Errorf("failed to rename %s back to %s: %v", l.NewPath, l.OldPath, err)
+			if ctx.Err() != nil {
+				iterErr = ctx.Err()
+				break
+			}
+
+			oldExists, pathErr := utils.PathExists(l.OldPath)
+			if pathErr != nil {
+				iterErr = fmt.Errorf("failed to inspect rollback destination %s: %w", l.OldPath, pathErr)
+				break
+			}
+			newExists, pathErr := utils.PathExists(l.NewPath)
+			if pathErr != nil {
+				iterErr = fmt.Errorf("failed to inspect rollback source %s: %w", l.NewPath, pathErr)
+				break
+			}
+
+			switch {
+			case !oldExists && newExists:
+				if err := os.Rename(l.NewPath, l.OldPath); err != nil {
+					iterErr = fmt.Errorf("failed to rename %s back to %s: %w", l.NewPath, l.OldPath, err)
 					break
 				}
 				renamedLogs = append(renamedLogs, l)
+			case oldExists && !newExists:
+				// A previous interrupted rollback already restored the file.
+			case oldExists && newExists:
+				iterErr = fmt.Errorf("refusing to overwrite existing rollback destination %s", l.OldPath)
+			default:
+				iterErr = fmt.Errorf("neither rollback source nor destination exists: %s, %s", l.NewPath, l.OldPath)
+			}
+			if iterErr != nil {
+				break
 			}
 
 			_, err = tx.Exec("DELETE FROM rollback_logs WHERE id = ?", l.Id)
@@ -1485,7 +1745,9 @@ func RollbackUpgrade(db *sqlx.DB) error {
 			tx.Rollback()
 			// Revert file renames to maintain consistency with the rolled-back database
 			for _, rl := range renamedLogs {
-				os.Rename(rl.OldPath, rl.NewPath)
+				if revertErr := os.Rename(rl.OldPath, rl.NewPath); revertErr != nil {
+					return fmt.Errorf("%v; additionally failed to restore upgraded path %s: %w", iterErr, rl.NewPath, revertErr)
+				}
 			}
 			return iterErr
 		}
@@ -1494,13 +1756,50 @@ func RollbackUpgrade(db *sqlx.DB) error {
 		drawProgressBar(processed, total)
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	cleanupTx, err := db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer cleanupTx.Rollback()
+
+	var stateTableExists int
+	if err := cleanupTx.Get(
+		&stateTableExists,
+		`SELECT EXISTS(
+			SELECT 1 FROM sqlite_master
+			WHERE type = 'table' AND name = 'upgrade_user_states'
+		)`,
+	); err != nil {
+		return fmt.Errorf("failed to inspect upgrade completion state: %w", err)
+	}
+	if stateTableExists != 0 {
+		if _, err := cleanupTx.Exec("DELETE FROM upgrade_user_states"); err != nil {
+			return fmt.Errorf("failed to clear upgrade completion state: %w", err)
+		}
+	}
+	if _, err := cleanupTx.Exec(`
+		DELETE FROM tweets
+		WHERE NOT EXISTS (
+			SELECT 1 FROM media_files WHERE media_files.tweet_id = tweets.id
+		)
+	`); err != nil {
+		return fmt.Errorf("failed to remove orphaned tweet records: %w", err)
+	}
+	if err := cleanupTx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit rollback cleanup: %w", err)
+	}
+
 	fmt.Println()
 	log.Infoln("Rollback completed successfully.")
 	return nil
 }
 
 func isNewFormatName(name string) bool {
-	if len(name) < 15 {
+	if len(name) < 14 {
 		return false
 	}
 	for i := 0; i < 8; i++ {
@@ -1511,17 +1810,15 @@ func isNewFormatName(name string) bool {
 	if name[8] != '_' {
 		return false
 	}
-	secondUnderscore := strings.Index(name[9:], "_")
-	dotIndex := strings.Index(name[9:], ".")
-	idEnd := -1
-	if secondUnderscore != -1 {
-		idEnd = 9 + secondUnderscore
-	} else if dotIndex != -1 {
-		idEnd = 9 + dotIndex
-	}
-	if idEnd == -1 {
+	if _, err := time.Parse("20060102", name[:8]); err != nil {
 		return false
 	}
+
+	idSeparator := strings.IndexByte(name[9:], '_')
+	if idSeparator < 1 {
+		return false
+	}
+	idEnd := 9 + idSeparator
 	idStr := name[9:idEnd]
 	if len(idStr) < 1 || len(idStr) > 20 {
 		return false
@@ -1530,6 +1827,30 @@ func isNewFormatName(name string) bool {
 		if idStr[i] < '0' || idStr[i] > '9' {
 			return false
 		}
+	}
+	tweetId, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil || tweetId == 0 {
+		return false
+	}
+
+	indexStart := idEnd + 1
+	indexEnd := indexStart
+	for indexEnd < len(name) && name[indexEnd] >= '0' && name[indexEnd] <= '9' {
+		indexEnd++
+	}
+	if indexEnd == indexStart || indexEnd >= len(name) {
+		return false
+	}
+	mediaIndex, err := strconv.ParseUint(name[indexStart:indexEnd], 10, 64)
+	if err != nil || mediaIndex == 0 {
+		return false
+	}
+	if name[indexEnd] != '_' && name[indexEnd] != '.' {
+		return false
+	}
+	extensionSeparator := strings.LastIndexByte(name, '.')
+	if extensionSeparator < indexEnd || extensionSeparator == len(name)-1 {
+		return false
 	}
 	return true
 }

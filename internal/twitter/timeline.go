@@ -2,11 +2,14 @@ package twitter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/go-resty/resty/v2"
 	"github.com/tidwall/gjson"
 )
+
+var ErrTimelineUnavailable = errors.New("user timeline is unavailable to this account")
 
 const (
 	timelineTweet = iota
@@ -108,7 +111,7 @@ func getTimelineItemContents(ctx context.Context, api timelineApi, client *resty
 	// is temporarily unavailable because it violates the Twitter Media Policy.
 	// Protected User's following: Permission denied
 	if string(resp) == "{\"data\":{\"user\":{}}}" {
-		return nil, "", nil
+		return nil, "", ErrTimelineUnavailable
 	}
 	instructions, err := getInstructions(resp, instPath)
 	if err != nil {

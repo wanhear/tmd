@@ -97,6 +97,13 @@ CREATE TABLE IF NOT EXISTS rollback_logs (
 	migrated_at DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS upgrade_user_states (
+	user_id INTEGER NOT NULL,
+	user_dir VARCHAR NOT NULL,
+	completed_at DATETIME NOT NULL,
+	PRIMARY KEY (user_id, user_dir)
+);
+
 CREATE INDEX IF NOT EXISTS idx_user_links_user_id ON user_links (user_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_tweet_id ON media_files(tweet_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_filename ON media_files(filename);
@@ -384,25 +391,47 @@ func UpdateUserLink(db *sqlx.DB, id int32, name string) error {
 }
 
 func SaveTweet(db *sqlx.DB, tweet *TweetRecord) error {
-	stmt := `INSERT OR IGNORE INTO tweets(id, user_id, text, created_at) VALUES(?, ?, ?, ?)`
+	stmt := `INSERT INTO tweets(id, user_id, text, created_at) VALUES(?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			user_id=excluded.user_id,
+			text=excluded.text,
+			created_at=excluded.created_at`
 	_, err := db.Exec(stmt, tweet.Id, tweet.UserId, tweet.Text, tweet.CreatedAt)
 	return err
 }
 
 func SaveTweetTx(tx *sqlx.Tx, tweet *TweetRecord) error {
-	stmt := `INSERT OR IGNORE INTO tweets(id, user_id, text, created_at) VALUES(?, ?, ?, ?)`
+	stmt := `INSERT INTO tweets(id, user_id, text, created_at) VALUES(?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			user_id=excluded.user_id,
+			text=excluded.text,
+			created_at=excluded.created_at`
 	_, err := tx.Exec(stmt, tweet.Id, tweet.UserId, tweet.Text, tweet.CreatedAt)
 	return err
 }
 
 func SaveMediaFile(db *sqlx.DB, media *MediaFileRecord) error {
-	stmt := `INSERT OR REPLACE INTO media_files(tweet_id, url, filename, original_filename, download_status, downloaded_at, file_size) VALUES(?, ?, ?, ?, ?, ?, ?)`
+	stmt := `INSERT INTO media_files(tweet_id, url, filename, original_filename, download_status, downloaded_at, file_size)
+		VALUES(?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(tweet_id, url) DO UPDATE SET
+			filename=excluded.filename,
+			original_filename=excluded.original_filename,
+			download_status=excluded.download_status,
+			downloaded_at=excluded.downloaded_at,
+			file_size=excluded.file_size`
 	_, err := db.Exec(stmt, media.TweetId, media.Url, media.Filename, media.OriginalFilename, media.DownloadStatus, media.DownloadedAt, media.FileSize)
 	return err
 }
 
 func SaveMediaFileTx(tx *sqlx.Tx, media *MediaFileRecord) error {
-	stmt := `INSERT OR REPLACE INTO media_files(tweet_id, url, filename, original_filename, download_status, downloaded_at, file_size) VALUES(?, ?, ?, ?, ?, ?, ?)`
+	stmt := `INSERT INTO media_files(tweet_id, url, filename, original_filename, download_status, downloaded_at, file_size)
+		VALUES(?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(tweet_id, url) DO UPDATE SET
+			filename=excluded.filename,
+			original_filename=excluded.original_filename,
+			download_status=excluded.download_status,
+			downloaded_at=excluded.downloaded_at,
+			file_size=excluded.file_size`
 	_, err := tx.Exec(stmt, media.TweetId, media.Url, media.Filename, media.OriginalFilename, media.DownloadStatus, media.DownloadedAt, media.FileSize)
 	return err
 }
@@ -419,7 +448,9 @@ func GetMediaFile(db *sqlx.DB, tweetId uint64, url string) (*MediaFileRecord, er
 
 func MigrateDatabase(db *sqlx.DB, rootPath string) error {
 	// 1. Ensure schema is created (including new tables)
-	db.MustExec(schema)
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
 
 	// 2. Perform path migration: convert absolute paths to relative paths
 	tx, err := db.Beginx()
@@ -443,7 +474,10 @@ func MigrateDatabase(db *sqlx.DB, rootPath string) error {
 		if filepath.IsAbs(ue.ParentDir) {
 			rel, err := filepath.Rel(rootPath, ue.ParentDir)
 			if err == nil {
-				_, err = tx.Exec("UPDATE user_entities SET parent_dir = ? WHERE id = ?", rel, ue.Id)
+				// A relative-path row may already coexist with this legacy
+				// absolute-path row. Keep the legacy row in that case because
+				// errors.json may still reference its entity id.
+				_, err = tx.Exec("UPDATE OR IGNORE user_entities SET parent_dir = ? WHERE id = ?", rel, ue.Id)
 				if err != nil {
 					return err
 				}
@@ -466,7 +500,7 @@ func MigrateDatabase(db *sqlx.DB, rootPath string) error {
 		if filepath.IsAbs(le.ParentDir) {
 			rel, err := filepath.Rel(rootPath, le.ParentDir)
 			if err == nil {
-				_, err = tx.Exec("UPDATE lst_entities SET parent_dir = ? WHERE id = ?", rel, le.Id)
+				_, err = tx.Exec("UPDATE OR IGNORE lst_entities SET parent_dir = ? WHERE id = ?", rel, le.Id)
 				if err != nil {
 					return err
 				}

@@ -184,7 +184,7 @@ func makeRateLimit(resp *resty.Response) *xRateLimit {
 	// If HTTP status is 429, we are rate limited. Create a rate limit even if headers are missing.
 	if resp.StatusCode() == 429 {
 		var limitNum int = 1
-		var remainingNum int = 0
+		const remainingNum = 0
 		var resetTimeTime time.Time
 
 		if resetTime != "" {
@@ -194,6 +194,11 @@ func makeRateLimit(resp *resty.Response) *xRateLimit {
 					duration := time.Unix(resetTimeNum, 0).Sub(serverTimeTime)
 					if duration > 0 {
 						resetTimeTime = time.Now().Add(duration)
+					} else {
+						// The server still returned 429 even though its reset
+						// timestamp is not in the future. Avoid an immediate
+						// retry loop when the local clock differs.
+						resetTimeTime = time.Now().Add(2 * time.Minute)
 					}
 				}
 				if resetTimeTime.IsZero() {
@@ -201,18 +206,16 @@ func makeRateLimit(resp *resty.Response) *xRateLimit {
 				}
 			}
 		}
-		if resetTimeTime.IsZero() {
+		if resetTimeTime.IsZero() || !resetTimeTime.After(time.Now()) {
 			resetTimeTime = time.Now().Add(2 * time.Minute)
 		}
 
 		if limit != "" {
-			limitNum, _ = strconv.Atoi(limit)
+			if parsedLimit, err := strconv.Atoi(limit); err == nil && parsedLimit > 0 {
+				limitNum = parsedLimit
+			}
 		}
-		if remaining != "" {
-			remainingNum, _ = strconv.Atoi(remaining)
-		}
-
-		log.Warnf("[RateLimiter] Forcing 429 rate limit fallback (duration: 2m) for path: %s", urlPath)
+		log.Warnf("[RateLimiter] Applied 429 rate limit for path %s until %s", urlPath, resetTimeTime.Format(time.RFC3339))
 
 		return &xRateLimit{
 			ResetTime: resetTimeTime,
@@ -246,6 +249,8 @@ func makeRateLimit(resp *resty.Response) *xRateLimit {
 		duration := time.Unix(resetTimeNum, 0).Sub(serverTimeTime)
 		if duration > 0 {
 			resetTimeTime = time.Now().Add(duration)
+		} else {
+			resetTimeTime = time.Now()
 		}
 	}
 	if resetTimeTime.IsZero() {
@@ -264,11 +269,13 @@ func makeRateLimit(resp *resty.Response) *xRateLimit {
 type rateLimiter struct {
 	limits      sync.Map
 	conds       sync.Map
-	nonBlocking bool
+	nonBlocking atomic.Bool
 }
 
-func newRateLimiter(nonBlocking bool) rateLimiter {
-	return rateLimiter{nonBlocking: nonBlocking}
+func newRateLimiter(nonBlocking bool) *rateLimiter {
+	limiter := &rateLimiter{}
+	limiter.nonBlocking.Store(nonBlocking)
+	return limiter
 }
 
 func (rateLimiter *rateLimiter) check(ctx context.Context, url *url.URL) error {
@@ -310,7 +317,7 @@ func (rateLimiter *rateLimiter) check(ctx context.Context, url *url.URL) error {
 
 	// limiter 为 nil 意味着不对此路径做速率限制
 	if limit != nil {
-		return limit.preRequest(ctx, rateLimiter.nonBlocking)
+		return limit.preRequest(ctx, rateLimiter.nonBlocking.Load())
 	}
 	return nil
 }
@@ -335,7 +342,8 @@ func (rateLimiter *rateLimiter) reset(url *url.URL, resp *resty.Response) {
 		return
 	}
 	limit := lim.(*xRateLimit)
-	if limit == nil || limit.Ready {
+	isRateLimitedResponse := resp != nil && resp.RawResponse != nil && resp.StatusCode() == 429
+	if limit == nil || (limit.Ready && !isRateLimitedResponse) {
 		return
 	}
 
@@ -372,15 +380,15 @@ func (rl *rateLimiter) wouldBlock(path string) bool {
 func SetRateLimitBlocking(client *resty.Client, blocking bool) {
 	if v, ok := clientRateLimiters.Load(client); ok {
 		rl := v.(*rateLimiter)
-		log.Infof("[RateLimiter] SetRateLimitBlocking: changing nonBlocking from %v to %v for client %p", rl.nonBlocking, !blocking, client)
-		rl.nonBlocking = !blocking
+		log.Infof("[RateLimiter] SetRateLimitBlocking: changing nonBlocking from %v to %v for client %p", rl.nonBlocking.Load(), !blocking, client)
+		rl.nonBlocking.Store(!blocking)
 	} else {
 		log.Warnf("[RateLimiter] SetRateLimitBlocking: client %p not found in rate limiters map", client)
 	}
 }
 
 func EnableRateLimit(client *resty.Client) {
-	rl := &rateLimiter{nonBlocking: true}
+	rl := newRateLimiter(true)
 	clientRateLimiters.Store(client, rl)
 
 	client.OnBeforeRequest(func(c *resty.Client, req *resty.Request) error {
