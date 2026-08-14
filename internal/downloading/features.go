@@ -458,8 +458,12 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	}
 
 	uidToUser := make(map[uint64]*twitter.User)
+	explicitUserIds := make(map[uint64]struct{})
 	for _, u := range users {
 		uidToUser[u.user.Id] = u.user
+		if u.leid == nil {
+			explicitUserIds[u.user.Id] = struct{}{}
+		}
 	}
 
 	// channels
@@ -511,8 +515,44 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			var err error
 			user := userInLST.user
 			leid := userInLST.leid
+			source := "direct-user"
+			if leid != nil {
+				source = "list-member"
+			}
+			decisionLogger := updaterLogger.WithFields(log.Fields{
+				"user":                user.Title(),
+				"user_id":             user.Id,
+				"source":              source,
+				"media_count":         user.MediaCount,
+				"media_count_present": user.MediaCountKnown,
+				"protected":           user.IsProtected,
+				"follow_state":        user.Followstate.String(),
+				"visible":             user.IsVisiable(),
+				"muting":              user.Muting,
+				"blocking":            user.Blocking,
+			})
+			if leid == nil {
+				decisionLogger.Infoln("evaluating explicitly requested user")
+			} else {
+				decisionLogger.Debugln("evaluating list member")
+			}
+			logNotQueued := func(entry *log.Entry) {
+				if leid == nil {
+					entry.Warnln("user was not queued for media download")
+				} else {
+					entry.Debugln("list member was not queued for media download")
+				}
+			}
 
 			if shouldIngoreUser(user) {
+				reasons := make([]string, 0, 2)
+				if user.Blocking {
+					reasons = append(reasons, "blocking=true")
+				}
+				if user.Muting {
+					reasons = append(reasons, "muting=true")
+				}
+				logNotQueued(decisionLogger.WithField("skip_reason", strings.Join(reasons, ", ")))
 				continue
 			}
 
@@ -520,7 +560,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			if !loaded {
 				pathEntity, err = syncUserAndEntity(db, user, dir)
 				if err != nil {
-					updaterLogger.WithField("user", user.Title()).Warnln("failed to update user or entity", err)
+					decisionLogger.WithError(err).Warnln("user was not queued because its database entity could not be synchronized")
 					continue
 				}
 				syncedUsers.Store(user.Id, pathEntity)
@@ -546,6 +586,26 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 					depthByEntity[pathEntity] = calcUserDepth(int(pathEntity.record.MediaCount.Int32), user.MediaCount)
 					userEntityHeap.Push(pathEntity)
 					deepest = max(deepest, depthByEntity[pathEntity])
+					decisionLogger.WithFields(log.Fields{
+						"entity_id":                pathEntity.Id(),
+						"stored_media_count":       pathEntity.record.MediaCount.Int32,
+						"stored_media_count_valid": pathEntity.record.MediaCount.Valid,
+						"request_depth":            depthByEntity[pathEntity],
+					}).Infoln("user queued for media timeline download")
+				} else if user.MediaCount == 0 {
+					reason := "API returned media_count=0"
+					if !user.MediaCountKnown {
+						reason = "API response did not contain legacy.media_count; parser defaulted it to 0"
+					}
+					logNotQueued(decisionLogger.WithFields(log.Fields{
+						"entity_id":   pathEntity.Id(),
+						"skip_reason": reason,
+					}))
+				} else {
+					logNotQueued(decisionLogger.WithFields(log.Fields{
+						"entity_id":   pathEntity.Id(),
+						"skip_reason": "user is protected and the primary account is not following it",
+					}))
 				}
 
 				// 自动关注
@@ -558,6 +618,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 				}
 			} else {
 				pathEntity = pe.(*UserEntity)
+				decisionLogger.WithField("entity_id", pathEntity.Id()).Debugln("user entity was already processed earlier in this run; not queued twice")
 			}
 
 			// 即便同步一个用户时也同步了所有指向此用户的链接，
@@ -595,6 +656,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	}()
 
 	if userEntityHeap.Empty() {
+		log.Warnln("no users were queued for media timeline download; review the preceding per-user skip_reason fields")
 		return nil, nil
 	}
 	log.Debugln("preprocessing finish, elapsed:", time.Since(start))
@@ -628,7 +690,36 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			return
 		}
 
-		tweets, err := user.GetMeidas(ctx, cli, &utils.TimeRange{Min: entity.LatestReleaseTime()})
+		baseline := entity.LatestReleaseTime()
+		_, explicitlyRequested := explicitUserIds[user.Id]
+		requestLogger := getterLogger.WithFields(log.Fields{
+			"user":                      user.Title(),
+			"user_id":                   user.Id,
+			"client":                    twitter.GetClientScreenName(cli),
+			"entity_id":                 entity.Id(),
+			"latest_release_time":       baseline,
+			"latest_release_time_valid": entity.record.LatestReleaseTime.Valid,
+			"api_media_count":           user.MediaCount,
+			"stored_media_count":        entity.record.MediaCount.Int32,
+		})
+		if explicitlyRequested {
+			requestLogger.Infoln("requesting media timeline for explicitly requested user")
+		}
+
+		tweets, err := user.GetMeidas(ctx, cli, &utils.TimeRange{Min: baseline})
+		if explicitlyRequested {
+			resultLogger := requestLogger.WithFields(log.Fields{
+				"returned_tweets": len(tweets),
+				"request_error":   err,
+			})
+			if err != nil {
+				resultLogger.Warnln("media timeline request failed")
+			} else if len(tweets) == 0 {
+				resultLogger.Warnln("media timeline request completed but returned no tweets to download")
+			} else {
+				resultLogger.Infoln("media timeline request completed")
+			}
+		}
 		if err == twitter.ErrWouldBlock {
 			userEntityHeap.Push(entity)
 			return

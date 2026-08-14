@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/unkmonster/tmd/internal/utils"
 )
@@ -18,6 +19,19 @@ const (
 	FS_REQUESTED
 )
 
+func (state FollowState) String() string {
+	switch state {
+	case FS_UNFOLLOW:
+		return "not-following"
+	case FS_FOLLOWING:
+		return "following"
+	case FS_REQUESTED:
+		return "requested"
+	default:
+		return fmt.Sprintf("unknown(%d)", state)
+	}
+}
+
 type User struct {
 	Id           uint64
 	Name         string
@@ -26,8 +40,11 @@ type User struct {
 	FriendsCount int
 	Followstate  FollowState
 	MediaCount   int
-	Muting       bool
-	Blocking     bool
+	// MediaCountKnown distinguishes a real zero returned by the API from a
+	// missing legacy.media_count field, which gjson also converts to zero.
+	MediaCountKnown bool `json:"-"`
+	Muting          bool
+	Blocking        bool
 }
 
 func GetUserById(ctx context.Context, client *resty.Client, id uint64) (*User, error) {
@@ -92,6 +109,7 @@ func parseUserResults(user_results *gjson.Result) (*User, error) {
 	usr.Name = name.String()
 	usr.ScreenName = screen_name.String()
 	usr.MediaCount = int(media_count.Int())
+	usr.MediaCountKnown = media_count.Exists()
 	usr.Muting = muting.Exists() && muting.Bool()
 	usr.Blocking = blocking.Exists() && blocking.Bool()
 	return &usr, nil
@@ -120,13 +138,13 @@ func itemContentsToTweets(itemContents []gjson.Result) []*Tweet {
 	return res
 }
 
-func (u *User) getMediasOnePage(ctx context.Context, api *userMedia, client *resty.Client) ([]*Tweet, string, error) {
+func (u *User) getMediasOnePage(ctx context.Context, api *userMedia, client *resty.Client) ([]*Tweet, string, int, error) {
 	if !u.IsVisiable() {
-		return nil, "", nil
+		return nil, "", 0, nil
 	}
 
 	itemContents, next, err := getTimelineItemContents(ctx, api, client, "data.user.result.timeline_v2.timeline.instructions")
-	return itemContentsToTweets(itemContents), next, err
+	return itemContentsToTweets(itemContents), next, len(itemContents), err
 }
 
 // 在逆序切片中，筛选出在 timerange 范围内的推文
@@ -176,6 +194,7 @@ func (u *User) GetMeidas(ctx context.Context, client *resty.Client, timeRange *u
 	api.userId = u.Id
 
 	results := make([]*Tweet, 0)
+	firstPage := true
 
 	var minTime *time.Time
 	var maxTime *time.Time
@@ -186,15 +205,45 @@ func (u *User) GetMeidas(ctx context.Context, client *resty.Client, timeRange *u
 	}
 
 	for {
-		currentTweets, next, err := u.getMediasOnePage(ctx, &api, client)
+		currentTweets, next, rawItemCount, err := u.getMediasOnePage(ctx, &api, client)
 		if err != nil {
 			return nil, err
 		}
 
 		if len(currentTweets) == 0 {
+			// The media timeline may occasionally return a cursor-only first
+			// page. Advance once so that a blank landing page does not make a
+			// non-empty timeline look complete.
+			if firstPage && next != "" && next != api.cursor {
+				log.WithFields(log.Fields{
+					"user":                 u.Title(),
+					"user_id":              u.Id,
+					"client":               GetClientScreenName(client),
+					"raw_timeline_items":   rawItemCount,
+					"parsed_media_tweets":  0,
+					"expected_media_count": u.MediaCount,
+					"has_next_cursor":      true,
+				}).Infoln("media timeline returned a cursor-only first page; advancing to the next cursor")
+				api.SetCursor(next)
+				firstPage = false
+				continue
+			}
+			if len(results) == 0 && u.MediaCount > 0 {
+				log.WithFields(log.Fields{
+					"user":                 u.Title(),
+					"user_id":              u.Id,
+					"client":               GetClientScreenName(client),
+					"raw_timeline_items":   rawItemCount,
+					"parsed_media_tweets":  0,
+					"expected_media_count": u.MediaCount,
+					"has_next_cursor":      next != "",
+					"first_page":           firstPage,
+				}).Warnln("media timeline ended without returning any parseable media tweets")
+			}
 			break // empty page
 		}
 
+		firstPage = false
 		api.SetCursor(next)
 
 		if timeRange == nil {
