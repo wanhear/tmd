@@ -1,10 +1,12 @@
 package downloading
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -43,6 +45,39 @@ func (pt TweetInDir) GetTweet() *twitter.Tweet {
 
 func (pt TweetInDir) GetPath() string {
 	return pt.path
+}
+
+func writeMediaFileAtomically(path string, body io.Reader, createdAt time.Time) (string, error) {
+	tempFile, err := os.CreateTemp(filepath.Dir(path), ".tmd-download-*")
+	if err != nil {
+		return "", err
+	}
+	tempPath := tempFile.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = tempFile.Close()
+		}
+		_ = os.Remove(tempPath)
+	}()
+
+	if _, err := io.Copy(tempFile, body); err != nil {
+		return "", err
+	}
+	if err := tempFile.Close(); err != nil {
+		closed = true
+		return "", err
+	}
+	closed = true
+
+	// Keep the existing best-effort timestamp behavior, but apply it before the
+	// file becomes visible at its final path.
+	_ = os.Chtimes(tempPath, time.Time{}, createdAt)
+
+	if err := os.Rename(tempPath, path); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // 任何一个 url 下载失败直接返回
@@ -167,18 +202,9 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 			return err
 		}
 
-		file, err := os.Create(path)
-		if err != nil {
+		if _, err := writeMediaFileAtomically(path, bytes.NewReader(resp.Body()), tweet.CreatedAt); err != nil {
 			return err
 		}
-
-		_, err = file.Write(resp.Body())
-		file.Close() // Close immediately to set modification time
-		if err != nil {
-			return err
-		}
-
-		os.Chtimes(path, time.Time{}, tweet.CreatedAt)
 
 		// Record success to DB
 		if db != nil {
