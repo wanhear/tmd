@@ -1313,20 +1313,38 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	}()
 
 	// 4. Start concurrent timeline checkers and file renamers
-	var entityChan = make(chan TempUserEntity, len(entities))
+	const numWorkers = 4
+	entityChan := make(chan TempUserEntity, len(entities)+numWorkers)
+	entityPending := int32(len(entities))
 	for _, entity := range entities {
 		entityChan <- entity
 	}
-	close(entityChan)
+	if len(entities) == 0 {
+		close(entityChan)
+	}
+	finishEntity := func() {
+		if atomic.AddInt32(&entityPending, -1) == 0 {
+			close(entityChan)
+		}
+	}
 
 	var workerWg sync.WaitGroup
-	const numWorkers = 4
 
 	for w := 0; w < numWorkers; w++ {
 		workerWg.Add(1)
 		go func() {
 			defer workerWg.Done()
-			for entity := range entityChan {
+			for {
+				var entity TempUserEntity
+				select {
+				case <-ctx.Done():
+					return
+				case queuedEntity, ok := <-entityChan:
+					if !ok {
+						return
+					}
+					entity = queuedEntity
+				}
 				if ctx.Err() != nil {
 					return
 				}
@@ -1338,6 +1356,7 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 				if entityErr := db.Get(&user, "SELECT * FROM users WHERE id = ?", entity.Uid); entityErr != nil {
 					atomic.AddInt32(&failedUsers, 1)
 					log.Errorf("\n[Error] Failed to load user %d from database: %v", entity.Uid, entityErr)
+					finishEntity()
 					continue
 				}
 
@@ -1369,6 +1388,7 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 				if entityErr != nil {
 					atomic.AddInt32(&failedUsers, 1)
 					log.Errorf("\n[Error] Failed to read upgrade state for user %s (%s): %v", twUser.Name, twUser.ScreenName, entityErr)
+					finishEntity()
 					continue
 				}
 				if upgradeCompleted != 0 {
@@ -1390,6 +1410,7 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 							}
 							if allExist {
 								atomic.AddInt32(&successUsers, 1)
+								finishEntity()
 								continue
 							}
 						}
@@ -1397,12 +1418,14 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 					if entityErr != nil {
 						atomic.AddInt32(&failedUsers, 1)
 						log.Errorf("\n[Error] Failed to validate completed upgrade for user %s (%s): %v", twUser.Name, twUser.ScreenName, entityErr)
+						finishEntity()
 						continue
 					}
 				}
 
 				var tweets []*twitter.Tweet
 				var fetchErr error
+				requeued := false
 				if len(clients) == 0 {
 					fetchErr = fmt.Errorf("no client available")
 				} else {
@@ -1456,11 +1479,18 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 							break
 						}
 						if allWouldBlock {
-							if twitter.SelectUserMediaClient(ctx, clients) == nil {
-								break
+							select {
+							case <-time.After(3 * time.Second):
+							case <-ctx.Done():
+								return
 							}
-							retry--
-							continue
+							select {
+							case entityChan <- entity:
+								requeued = true
+							case <-ctx.Done():
+								return
+							}
+							break
 						}
 						log.Warnf("\n[Retry] Failed to fetch timeline for user %s (%s), retrying (%d/3)... Error: %v", twUser.Name, twUser.ScreenName, retry+1, fetchErr)
 						select {
@@ -1471,9 +1501,13 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 					}
 				}
 
+				if requeued {
+					continue
+				}
 				if fetchErr != nil {
 					atomic.AddInt32(&failedUsers, 1)
 					log.Errorf("\n[Error] Failed to fetch timeline for user %s (%s) after 3 retries: %v", twUser.Name, twUser.ScreenName, fetchErr)
+					finishEntity()
 					continue
 				}
 
@@ -1714,6 +1748,7 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 				if !entityComplete {
 					atomic.AddInt32(&failedUsers, 1)
 					log.Errorf("\n[Error] User %s (%s) was not marked complete because one or more media items could not be processed.", twUser.Name, twUser.ScreenName)
+					finishEntity()
 					continue
 				}
 
@@ -1726,6 +1761,7 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 					},
 				}:
 					atomic.AddInt32(&successUsers, 1)
+					finishEntity()
 				case <-ctx.Done():
 					return
 				}
