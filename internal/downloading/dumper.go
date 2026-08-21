@@ -2,11 +2,11 @@ package downloading
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 
 	"github.com/jmoiron/sqlx"
+	log "github.com/sirupsen/logrus"
 	"github.com/unkmonster/tmd/internal/database"
 	"github.com/unkmonster/tmd/internal/twitter"
 )
@@ -85,6 +85,39 @@ func (td *TweetDumper) Clear() {
 	td.count = 0
 }
 
+// Remove deletes only the specified tweets from one entity's retry queue.
+func (td *TweetDumper) Remove(eid int, tweets ...*twitter.Tweet) int {
+	existing, ok := td.data[eid]
+	if !ok || len(tweets) == 0 {
+		return 0
+	}
+
+	toRemove := make(map[uint64]struct{}, len(tweets))
+	for _, tw := range tweets {
+		toRemove[tw.Id] = struct{}{}
+	}
+
+	removed := 0
+	remaining := existing[:0]
+	for _, tw := range existing {
+		if _, ok := toRemove[tw.Id]; ok {
+			delete(td.set[eid], tw.Id)
+			td.count--
+			removed++
+			continue
+		}
+		remaining = append(remaining, tw)
+	}
+
+	if len(remaining) == 0 {
+		delete(td.data, eid)
+		delete(td.set, eid)
+	} else {
+		td.data[eid] = remaining
+	}
+	return removed
+}
+
 func (td *TweetDumper) GetTotal(db *sqlx.DB) ([]*TweetInEntity, error) {
 	results := make([]*TweetInEntity, 0, td.count)
 
@@ -94,7 +127,11 @@ func (td *TweetDumper) GetTotal(db *sqlx.DB) ([]*TweetInEntity, error) {
 			return nil, err
 		}
 		if e == nil {
-			return nil, fmt.Errorf("entity %d is not exists", k)
+			log.WithFields(log.Fields{
+				"entity_id": k,
+				"tweets":    len(v),
+			}).Warnln("skipping failed tweet retries because the user entity no longer exists")
+			continue
 		}
 		ue := UserEntity{db: db, record: e, created: true}
 

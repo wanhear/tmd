@@ -373,7 +373,10 @@ func main() {
 	// dump failed tweets at exit
 	var todump = make([]*downloading.TweetInEntity, 0)
 	defer func() {
-		dumper.Dump(pathHelper.errorj)
+		if err := dumper.Dump(pathHelper.errorj); err != nil {
+			log.Errorln("failed to save failed tweet queue:", err)
+			return
+		}
 		log.Infof("%d tweets have been dumped and will be downloaded the next time the program runs", dumper.Count())
 	}()
 
@@ -384,7 +387,9 @@ func main() {
 		}
 		// 如果手动取消，不尝试重试，快速终止进程
 		if ctx.Err() != context.Canceled && !noRetry {
-			retryFailedTweets(ctx, dumper, db, client)
+			if err := retryFailedTweets(ctx, dumper, db, client); err != nil {
+				log.Errorln("failed to retry previously failed tweets:", err)
+			}
 		}
 	}()
 
@@ -520,7 +525,13 @@ func retryFailedTweets(ctx context.Context, dumper *downloading.TweetDumper, db 
 	}
 
 	newFails := downloading.BatchDownloadTweet(ctx, client, toretry...)
-	dumper.Clear()
+	attempted := make(map[int][]*twitter.Tweet)
+	for _, leg := range legacy {
+		attempted[leg.Entity.Id()] = append(attempted[leg.Entity.Id()], leg.Tweet)
+	}
+	for entityID, tweets := range attempted {
+		dumper.Remove(entityID, tweets...)
+	}
 	for _, pt := range newFails {
 		te := pt.(*downloading.TweetInEntity)
 		dumper.Push(te.Entity.Id(), te.Tweet)
