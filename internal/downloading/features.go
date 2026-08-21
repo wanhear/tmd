@@ -1063,9 +1063,30 @@ type upgradeCompletion struct {
 	userId      uint64
 	userDir     string
 	completedAt time.Time
+	status      string
+	lastError   sql.NullString
+	retryAfter  sql.NullTime
 }
 
-func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx.DB, rootPath string, additional []*resty.Client) error {
+const (
+	upgradeStatusCompleted = "completed"
+	upgradeStatusDeferred  = "deferred"
+	upgradeRetryDelay      = 7 * 24 * time.Hour
+)
+
+func isDeferredUpgradeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, twitter.ErrTimelineUnavailable) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "user unavailable") ||
+		strings.Contains(message, "user unavaiable")
+}
+
+func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx.DB, rootPath string, additional []*resty.Client) (retErr error) {
 	log.Infoln("Starting full database and filename upgrade...")
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -1074,11 +1095,14 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	errorJsonPath := filepath.Join(rootPath, ".data", "errors.json")
 	dumper := NewDumper()
 	if err := dumper.Load(errorJsonPath); err != nil {
-		log.Warnf("Failed to load existing errors.json: %v", err)
+		return fmt.Errorf("failed to load existing errors.json; refusing to overwrite the retry queue: %w", err)
 	}
 	defer func() {
 		if err := dumper.Dump(errorJsonPath); err != nil {
 			log.Errorf("\nFailed to dump missing files to %s: %v", errorJsonPath, err)
+			if retErr == nil {
+				retErr = fmt.Errorf("failed to persist retry queue: %w", err)
+			}
 		} else if dumper.Count() > 0 {
 			log.Infof("Successfully recorded %d pending/missing files to %s", dumper.Count(), errorJsonPath)
 		}
@@ -1088,13 +1112,14 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	clients = append(clients, client)
 	clients = append(clients, additional...)
 
-	// 1. Get total media count for progress bar
+	// 1. Keep the reported media count for diagnostics only. Media totals can
+	// grow while timelines are inspected, so user completion drives progress.
 	var totalMedia int
 	err := db.Get(&totalMedia, "SELECT COALESCE(SUM(media_count), 0) FROM user_entities")
 	if err != nil {
 		totalMedia = 0
 	}
-	log.Infof("Estimated files to process: %d", totalMedia)
+	log.Infof("Reported media count (informational): %d", totalMedia)
 
 	// 2. Fetch all user entities
 	type TempUserEntity struct {
@@ -1138,20 +1163,16 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	}
 	entities = uniqueEntities
 
-	var initialProcessed int
-	err = db.Get(&initialProcessed, "SELECT COUNT(*) FROM media_files WHERE download_status = 1")
-	if err != nil {
-		initialProcessed = 0
-	}
-	var processedCounter = int32(initialProcessed)
+	var processedUsers int32
 	var successUsers int32
 	var failedUsers int32
+	var deferredUsers int32
 	var missingFiles int32
 	var progressMtx sync.Mutex
 	drawUpgradeProgress := func() {
 		progressMtx.Lock()
 		defer progressMtx.Unlock()
-		drawProgressBar(int(atomic.LoadInt32(&processedCounter)), totalMedia)
+		drawProgressBar(int(atomic.LoadInt32(&processedUsers)), len(entities))
 	}
 	drawUpgradeProgress()
 
@@ -1258,10 +1279,19 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 
 				for _, completion := range completions {
 					_, err = completionTx.Exec(
-						`INSERT OR REPLACE INTO upgrade_user_states(user_id, user_dir, completed_at) VALUES(?, ?, ?)`,
+						`INSERT INTO upgrade_user_states(user_id, user_dir, completed_at, status, last_error, retry_after)
+						 VALUES(?, ?, ?, ?, ?, ?)
+						 ON CONFLICT(user_id, user_dir) DO UPDATE SET
+							completed_at = excluded.completed_at,
+							status = excluded.status,
+							last_error = excluded.last_error,
+							retry_after = excluded.retry_after`,
 						completion.userId,
 						completion.userDir,
 						completion.completedAt,
+						completion.status,
+						completion.lastError,
+						completion.retryAfter,
 					)
 					if err != nil {
 						return fmt.Errorf("failed to mark user upgrade complete: %w", err)
@@ -1323,6 +1353,8 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 		close(entityChan)
 	}
 	finishEntity := func() {
+		atomic.AddInt32(&processedUsers, 1)
+		drawUpgradeProgress()
 		if atomic.AddInt32(&entityPending, -1) == 0 {
 			close(entityChan)
 		}
@@ -1372,38 +1404,102 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 					Followstate: twitter.FS_FOLLOWING,
 				}
 
-				// Only a durable completion marker may authorize the fast path.
-				// Existing media rows alone cannot prove that a previous run
-				// finished processing the user's complete visible timeline.
-				var upgradeCompleted int
+				// Rebuild the retry queue from the database before any fast path.
+				// This keeps pending media recoverable even if a previous process
+				// committed status=2 and exited before errors.json was replaced.
+				type pendingMediaRow struct {
+					TweetID   uint64    `db:"tweet_id"`
+					Text      string    `db:"text"`
+					CreatedAt time.Time `db:"created_at"`
+					URL       string    `db:"url"`
+				}
+				var pendingRows []pendingMediaRow
+				if entityErr := db.Select(
+					&pendingRows,
+					`SELECT t.id AS tweet_id, t.text, t.created_at, mf.url
+					 FROM tweets t
+					 JOIN media_files mf ON mf.tweet_id = t.id
+					 WHERE t.user_id = ?
+					   AND EXISTS (
+						SELECT 1 FROM media_files pending
+						WHERE pending.tweet_id = t.id AND pending.download_status = 2
+					   )
+					 ORDER BY t.id, mf.id`,
+					entity.Uid,
+				); entityErr != nil {
+					atomic.AddInt32(&failedUsers, 1)
+					log.Errorf("\n[Error] Failed to rebuild pending media queue for user %s (%s): %v", twUser.Name, twUser.ScreenName, entityErr)
+					finishEntity()
+					continue
+				}
+				pendingByID := make(map[uint64]*twitter.Tweet)
+				pendingTweets := make([]*twitter.Tweet, 0)
+				for _, row := range pendingRows {
+					tw := pendingByID[row.TweetID]
+					if tw == nil {
+						tw = &twitter.Tweet{
+							Id:        row.TweetID,
+							Text:      row.Text,
+							CreatedAt: row.CreatedAt,
+							Creator:   twUser,
+						}
+						pendingByID[row.TweetID] = tw
+						pendingTweets = append(pendingTweets, tw)
+					}
+					tw.Urls = append(tw.Urls, row.URL)
+				}
+				for _, tw := range pendingTweets {
+					select {
+					case dbWriteChan <- dbWriteTask{entityId: entity.Id, rawTweet: tw}:
+					case <-ctx.Done():
+						return
+					}
+				}
+
+				// A completed marker means the user's visible timeline was fully
+				// inspected. Pending media rows are a download concern and must not
+				// force the complete timeline through the migration again.
+				var upgradeState struct {
+					Status     string       `db:"status"`
+					RetryAfter sql.NullTime `db:"retry_after"`
+				}
 				entityErr := db.Get(
-					&upgradeCompleted,
-					`SELECT EXISTS(
-						SELECT 1 FROM upgrade_user_states
-						WHERE user_id = ? AND user_dir = ?
-					)`,
+					&upgradeState,
+					`SELECT status, retry_after FROM upgrade_user_states
+					 WHERE user_id = ? AND user_dir = ?`,
 					entity.Uid,
 					userDir,
 				)
-				if entityErr != nil {
+				if entityErr != nil && !errors.Is(entityErr, sql.ErrNoRows) {
 					atomic.AddInt32(&failedUsers, 1)
 					log.Errorf("\n[Error] Failed to read upgrade state for user %s (%s): %v", twUser.Name, twUser.ScreenName, entityErr)
 					finishEntity()
 					continue
 				}
-				if upgradeCompleted != 0 {
-					var pendingCount int
-					entityErr = db.Get(&pendingCount, "SELECT COUNT(*) FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ? AND mf.download_status != 1", entity.Uid)
-					if entityErr == nil && pendingCount == 0 {
+				if entityErr == nil {
+					if upgradeState.Status == upgradeStatusDeferred && upgradeState.RetryAfter.Valid && time.Now().Before(upgradeState.RetryAfter.Time) {
+						atomic.AddInt32(&deferredUsers, 1)
+						log.Warnf("\n[Deferred] Skipping unavailable user %s (%s) until %s", twUser.Name, twUser.ScreenName, upgradeState.RetryAfter.Time.Format(time.RFC3339))
+						finishEntity()
+						continue
+					}
+
+					if upgradeState.Status == upgradeStatusCompleted {
 						var files []struct {
 							Filename string `db:"filename"`
 						}
-						entityErr = db.Select(&files, "SELECT filename FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ?", entity.Uid)
+						entityErr = db.Select(&files, "SELECT filename FROM media_files mf JOIN tweets t ON mf.tweet_id = t.id WHERE t.user_id = ? AND mf.download_status = 1", entity.Uid)
 						if entityErr == nil {
 							allExist := true
 							for _, f := range files {
 								p := filepath.Join(userDir, f.Filename)
-								if ok, _ := utils.PathExists(p); !ok {
+								ok, pathErr := utils.PathExists(p)
+								if pathErr != nil {
+									entityErr = fmt.Errorf("failed to inspect %s: %w", p, pathErr)
+									allExist = false
+									break
+								}
+								if !ok {
 									allExist = false
 									break
 								}
@@ -1414,20 +1510,23 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 								continue
 							}
 						}
-					}
-					if entityErr != nil {
-						atomic.AddInt32(&failedUsers, 1)
-						log.Errorf("\n[Error] Failed to validate completed upgrade for user %s (%s): %v", twUser.Name, twUser.ScreenName, entityErr)
-						finishEntity()
-						continue
+						if entityErr != nil {
+							atomic.AddInt32(&failedUsers, 1)
+							log.Errorf("\n[Error] Failed to validate completed upgrade for user %s (%s): %v", twUser.Name, twUser.ScreenName, entityErr)
+							finishEntity()
+							continue
+						}
 					}
 				}
 
 				var tweets []*twitter.Tweet
 				var fetchErr error
 				requeued := false
+				attemptedAny := false
+				allAttemptsDeferred := true
 				if len(clients) == 0 {
 					fetchErr = fmt.Errorf("no client available")
+					allAttemptsDeferred = false
 				} else {
 					startClient := int(entity.Uid % uint64(len(clients)))
 					for retry := 0; retry < 3; retry++ {
@@ -1440,11 +1539,15 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 								continue
 							}
 							attemptedClient = true
+							attemptedAny = true
 
 							tweets, fetchErr = twUser.GetMeidas(ctx, cli, nil)
 							if fetchErr == nil {
 								allWouldBlock = false
 								break
+							}
+							if !isDeferredUpgradeError(fetchErr) {
+								allAttemptsDeferred = false
 							}
 							if ctx.Err() != nil {
 								return
@@ -1505,6 +1608,27 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 					continue
 				}
 				if fetchErr != nil {
+					if attemptedAny && allAttemptsDeferred && isDeferredUpgradeError(fetchErr) {
+						retryAfter := time.Now().Add(upgradeRetryDelay)
+						select {
+						case dbWriteChan <- dbWriteTask{
+							complete: &upgradeCompletion{
+								userId:      entity.Uid,
+								userDir:     userDir,
+								completedAt: time.Now(),
+								status:      upgradeStatusDeferred,
+								lastError:   sql.NullString{String: fetchErr.Error(), Valid: true},
+								retryAfter:  sql.NullTime{Time: retryAfter, Valid: true},
+							},
+						}:
+							atomic.AddInt32(&deferredUsers, 1)
+							log.Warnf("\n[Deferred] Timeline for user %s (%s) is unavailable; retry after %s. Error: %v", twUser.Name, twUser.ScreenName, retryAfter.Format(time.RFC3339), fetchErr)
+							finishEntity()
+						case <-ctx.Done():
+							return
+						}
+						continue
+					}
 					atomic.AddInt32(&failedUsers, 1)
 					log.Errorf("\n[Error] Failed to fetch timeline for user %s (%s) after 3 retries: %v", twUser.Name, twUser.ScreenName, fetchErr)
 					finishEntity()
@@ -1572,8 +1696,6 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 								return
 							}
 
-							atomic.AddInt32(&processedCounter, 1)
-							drawUpgradeProgress()
 							continue
 						}
 
@@ -1740,8 +1862,6 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 							atomic.AddInt32(&missingFiles, 1)
 						}
 
-						atomic.AddInt32(&processedCounter, 1)
-						drawUpgradeProgress()
 					}
 				}
 
@@ -1758,6 +1878,7 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 						userId:      entity.Uid,
 						userDir:     userDir,
 						completedAt: time.Now(),
+						status:      upgradeStatusCompleted,
 					},
 				}:
 					atomic.AddInt32(&successUsers, 1)
@@ -1787,6 +1908,7 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 
 	totalUsers := len(entities)
 	failedCount := atomic.LoadInt32(&failedUsers)
+	deferredCount := atomic.LoadInt32(&deferredUsers)
 
 	if failedCount == int32(totalUsers) && totalUsers > 0 {
 		return fmt.Errorf("upgrade aborted: all %d users failed to fetch timelines. Please check your network connection, proxy settings, or Twitter API rate limits", totalUsers)
@@ -1795,13 +1917,17 @@ func UpgradeDatabaseAndFiles(ctx context.Context, client *resty.Client, db *sqlx
 	if failedCount > 0 {
 		return fmt.Errorf("upgrade incomplete: %d/%d users failed to process; run '--upgrade' again to retry", failedCount, totalUsers)
 	}
-
 	missingCount := atomic.LoadInt32(&missingFiles)
 	if missingCount > 0 {
 		log.Infof("Upgrade process completed. Found %d missing media files on disk. They have been logged as pending in database and will be auto-completed during your next download session.", missingCount)
 	}
 
-	log.Infoln("Upgrade completed successfully.")
+	pendingTweetCount := dumper.Count()
+	if deferredCount > 0 || pendingTweetCount > 0 {
+		log.Warnf("Upgrade migration pass finished with %d/%d unavailable users deferred and %d tweets in the media retry queue. A normal download command will retry that queue; rerunning '--upgrade' is not required.", deferredCount, totalUsers, pendingTweetCount)
+	} else {
+		log.Infoln("Upgrade completed successfully.")
+	}
 	return nil
 }
 

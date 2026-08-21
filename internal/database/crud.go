@@ -101,10 +101,14 @@ CREATE TABLE IF NOT EXISTS upgrade_user_states (
 	user_id INTEGER NOT NULL,
 	user_dir VARCHAR NOT NULL,
 	completed_at DATETIME NOT NULL,
+	status VARCHAR NOT NULL DEFAULT 'completed',
+	last_error TEXT,
+	retry_after DATETIME,
 	PRIMARY KEY (user_id, user_dir)
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_links_user_id ON user_links (user_id);
+CREATE INDEX IF NOT EXISTS idx_tweets_user_id ON tweets(user_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_tweet_id ON media_files(tweet_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_filename ON media_files(filename);
 `
@@ -450,6 +454,36 @@ func MigrateDatabase(db *sqlx.DB, rootPath string) error {
 	// 1. Ensure schema is created (including new tables)
 	if _, err := db.Exec(schema); err != nil {
 		return err
+	}
+
+	// CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+	// Keep the upgrade state extensible without rebuilding user data.
+	type tableColumn struct {
+		Name string `db:"name"`
+	}
+	var stateColumns []tableColumn
+	if err := db.Select(&stateColumns, "SELECT name FROM pragma_table_info('upgrade_user_states')"); err != nil {
+		return err
+	}
+	existingStateColumns := make(map[string]struct{}, len(stateColumns))
+	for _, column := range stateColumns {
+		existingStateColumns[column.Name] = struct{}{}
+	}
+	stateMigrations := []struct {
+		name string
+		sql  string
+	}{
+		{"status", "ALTER TABLE upgrade_user_states ADD COLUMN status VARCHAR NOT NULL DEFAULT 'completed'"},
+		{"last_error", "ALTER TABLE upgrade_user_states ADD COLUMN last_error TEXT"},
+		{"retry_after", "ALTER TABLE upgrade_user_states ADD COLUMN retry_after DATETIME"},
+	}
+	for _, migration := range stateMigrations {
+		if _, exists := existingStateColumns[migration.name]; exists {
+			continue
+		}
+		if _, err := db.Exec(migration.sql); err != nil {
+			return err
+		}
 	}
 
 	// 2. Perform path migration: convert absolute paths to relative paths
