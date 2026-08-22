@@ -141,6 +141,8 @@ func hasValidMP4FileTypeBox(body []byte) bool {
 	return boxSize >= headerSize+4 && boxSize <= uint64(len(body))
 }
 
+// Permanently unavailable attachments must not block later media.
+// TODO: make retryable multi-attachment downloads idempotent.
 func downloadTweetMedia(ctx context.Context, client *resty.Client, dir string, tweet *twitter.Tweet) error {
 	text := utils.WinFileName(tweet.Text)
 
