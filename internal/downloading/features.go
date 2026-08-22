@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -80,8 +82,70 @@ func writeMediaFileAtomically(path string, body io.Reader, createdAt time.Time) 
 	return path, nil
 }
 
-// 任何一个 url 下载失败直接返回
-// TODO: 要么全做，要么不做
+func validateMediaResponse(resp *resty.Response, ext string) error {
+	body := resp.Body()
+	if len(body) == 0 {
+		return fmt.Errorf("empty media response")
+	}
+
+	detected := http.DetectContentType(body)
+	expected := ""
+	valid := false
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg":
+		expected = "image/jpeg"
+		valid = detected == expected
+	case ".png":
+		expected = "image/png"
+		valid = detected == expected
+	case ".gif":
+		expected = "image/gif"
+		valid = detected == expected
+	case ".webp":
+		expected = "image/webp"
+		valid = detected == expected
+	case ".mp4", ".m4v":
+		expected = "video/mp4"
+		valid = hasValidMP4FileTypeBox(body)
+	case ".webm":
+		expected = "video/webm"
+		valid = detected == expected
+	default:
+		valid = strings.HasPrefix(detected, "image/") || strings.HasPrefix(detected, "video/")
+	}
+	if !valid {
+		return fmt.Errorf(
+			"unexpected media response: extension=%q, declared_content_type=%q, detected_content_type=%q, size=%d",
+			ext,
+			resp.Header().Get("Content-Type"),
+			detected,
+			len(body),
+		)
+	}
+	return nil
+}
+
+func hasValidMP4FileTypeBox(body []byte) bool {
+	if len(body) < 12 || !bytes.Equal(body[4:8], []byte("ftyp")) {
+		return false
+	}
+
+	boxSize := uint64(binary.BigEndian.Uint32(body[:4]))
+	headerSize := uint64(8)
+	if boxSize == 1 {
+		if len(body) < 20 {
+			return false
+		}
+		boxSize = binary.BigEndian.Uint64(body[8:16])
+		headerSize = 16
+	} else if boxSize == 0 {
+		boxSize = uint64(len(body))
+	}
+	return boxSize >= headerSize+4 && boxSize <= uint64(len(body))
+}
+
+// Download every attachment that can still succeed. Retryable failures are
+// returned after the remaining attachments have been attempted.
 func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, dir string, tweet *twitter.Tweet) error {
 	saveMediaRecord := func(media *database.MediaFileRecord) error {
 		if db == nil {
@@ -99,10 +163,14 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 		return database.SaveMediaFile(db, media)
 	}
 
+	var firstRetryErr error
 	for i, u := range tweet.Urls {
 		ext, err := utils.GetExtFromUrl(u)
 		if err != nil {
-			return err
+			if firstRetryErr == nil {
+				firstRetryErr = err
+			}
+			continue
 		}
 
 		// Generate deterministic filenames
@@ -186,24 +254,79 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 
 		// 4. Perform HTTP request to download
 		resp, err := client.R().SetContext(ctx).SetQueryParam("name", "4096x4096").Get(u)
+		if err == nil && resp == nil {
+			err = errors.New("media request returned no response")
+		} else if err == nil {
+			err = utils.CheckRespStatus(resp)
+		}
 		if err != nil {
+			unavailable := utils.IsStatusCode(err, 403) || utils.IsStatusCode(err, 404)
+			if resp != nil {
+				unavailable = unavailable || resp.StatusCode() == 403 || resp.StatusCode() == 404
+			}
+			if db != nil {
+				status := 2
+				if unavailable {
+					status = 3 // Permanently unavailable (for example DMCA/removed media)
+				}
+				dbMedia := &database.MediaFileRecord{
+					TweetId:          tweet.Id,
+					Url:              u,
+					Filename:         truncatedName,
+					OriginalFilename: originalName,
+					DownloadStatus:   status,
+				}
+				if recordErr := saveMediaRecord(dbMedia); recordErr != nil {
+					return fmt.Errorf("download failed (%v) and failure status could not be saved: %w", err, recordErr)
+				}
+			}
+			if unavailable {
+				log.WithFields(log.Fields{
+					"tweet_id":         tweet.Id,
+					"attachment_index": i + 1,
+				}).Warnln("media attachment is unavailable; continuing with remaining attachments")
+				continue
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if firstRetryErr == nil {
+				firstRetryErr = err
+			}
+			continue
+		}
+		if err := validateMediaResponse(resp, ext); err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"tweet_id":         tweet.Id,
+				"attachment_index": i + 1,
+				"url":              u,
+			}).Warnln("media response was rejected; keeping the attachment retryable")
 			if db != nil {
 				dbMedia := &database.MediaFileRecord{
 					TweetId:          tweet.Id,
 					Url:              u,
 					Filename:         truncatedName,
 					OriginalFilename: originalName,
-					DownloadStatus:   2, // failed
+					DownloadStatus:   2,
 				}
 				if recordErr := saveMediaRecord(dbMedia); recordErr != nil {
-					return fmt.Errorf("download failed (%v) and failure status could not be saved: %w", err, recordErr)
+					return fmt.Errorf("media validation failed (%v) and failure status could not be saved: %w", err, recordErr)
 				}
 			}
-			return err
+			if firstRetryErr == nil {
+				firstRetryErr = err
+			}
+			continue
 		}
 
 		if _, err := writeMediaFileAtomically(path, bytes.NewReader(resp.Body()), tweet.CreatedAt); err != nil {
-			return err
+			if errors.Is(err, syscall.ENOSPC) || ctx.Err() != nil {
+				return err
+			}
+			if firstRetryErr == nil {
+				firstRetryErr = err
+			}
+			continue
 		}
 
 		// Record success to DB
@@ -221,6 +344,9 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 				return err
 			}
 		}
+	}
+	if firstRetryErr != nil {
+		return firstRetryErr
 	}
 
 	fmt.Printf("%s %s\n", color.FgLightMagenta.Render("["+tweet.Creator.Title()+"]"), utils.WinFileName(tweet.Text))
@@ -283,8 +409,7 @@ func tweetDownloader(client *resty.Client, config *workerConfig, errch chan<- Pa
 			continue
 		}
 		err := downloadTweetMedia(config.ctx, client, config.db, path, pt.GetTweet())
-		// 403: Dmcaed
-		if err != nil && !utils.IsStatusCode(err, 404) && !utils.IsStatusCode(err, 403) {
+		if err != nil {
 			errch <- pt
 		}
 
@@ -372,15 +497,8 @@ func syncUser(db *sqlx.DB, user *twitter.User) error {
 	return err
 }
 
-func getTweetAndUpdateLatestReleaseTime(ctx context.Context, client *resty.Client, user *twitter.User, entity *UserEntity) ([]*twitter.Tweet, error) {
-	tweets, err := user.GetMeidas(ctx, client, &utils.TimeRange{Min: entity.LatestReleaseTime()})
-	if err != nil || len(tweets) == 0 {
-		return nil, err
-	}
-	if err := entity.SetLatestReleaseTime(tweets[0].CreatedAt); err != nil {
-		return nil, err
-	}
-	return tweets, nil
+func getTweetsSinceLatestReleaseTime(ctx context.Context, client *resty.Client, user *twitter.User, entity *UserEntity) ([]*twitter.Tweet, error) {
+	return user.GetMeidas(ctx, client, &utils.TimeRange{Min: entity.LatestReleaseTime()})
 }
 
 func DownloadUser(ctx context.Context, db *sqlx.DB, client *resty.Client, user *twitter.User, dir string) ([]PackgedTweet, error) {
@@ -399,7 +517,7 @@ func DownloadUser(ctx context.Context, db *sqlx.DB, client *resty.Client, user *
 	}
 
 	syncedUsers.Store(user.Id, entity)
-	tweets, err := getTweetAndUpdateLatestReleaseTime(ctx, client, user, entity)
+	tweets, err := getTweetsSinceLatestReleaseTime(ctx, client, user, entity)
 	if err != nil || len(tweets) == 0 {
 		return nil, err
 	}
@@ -410,7 +528,13 @@ func DownloadUser(ctx context.Context, db *sqlx.DB, client *resty.Client, user *
 		pts = append(pts, TweetInEntity{Tweet: tw, Entity: entity})
 	}
 
-	return BatchDownloadTweet(ctx, client, db, pts...), nil
+	fails := BatchDownloadTweet(ctx, client, db, pts...)
+	if len(fails) == 0 && ctx.Err() == nil {
+		if err := entity.SetLatestReleaseTime(tweets[0].CreatedAt); err != nil {
+			return fails, err
+		}
+	}
+	return fails, nil
 }
 
 func syncUserAndEntity(db *sqlx.DB, user *twitter.User, dir string) (*UserEntity, error) {
@@ -693,6 +817,13 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	clients := make([]*resty.Client, 0)
 	clients = append(clients, client)
 	clients = append(clients, additional...)
+	type pendingTweetStat struct {
+		entity     *UserEntity
+		latest     time.Time
+		mediaCount int
+	}
+	pendingStats := make(map[int]pendingTweetStat)
+	var pendingStatsMtx sync.Mutex
 
 	producer := func(entity *UserEntity) {
 		defer prodwg.Done()
@@ -788,10 +919,13 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			}
 		}
 
-		if err := database.UpdateUserEntityTweetStat(db, entity.Id(), tweets[0].CreatedAt, user.MediaCount); err != nil {
-			// 影响程序的正确性，必须 Panic
-			getterLogger.WithField("user", entity.Name()).Panicln("failed to update user tweets stat:", err)
+		pendingStatsMtx.Lock()
+		pendingStats[entity.Id()] = pendingTweetStat{
+			entity:     entity,
+			latest:     tweets[0].CreatedAt,
+			mediaCount: user.MediaCount,
 		}
+		pendingStatsMtx.Unlock()
 	}
 
 	// launch worker
@@ -858,11 +992,30 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	}()
 
 	fails := []*TweetInEntity{}
+	failedEntityIDs := make(map[int]struct{})
 	for pt := range errChan {
-		fails = append(fails, pt.(*TweetInEntity))
+		failed := pt.(*TweetInEntity)
+		fails = append(fails, failed)
+		failedEntityIDs[failed.Entity.Id()] = struct{}{}
+	}
+	cause := context.Cause(ctx)
+	if cause == nil {
+		pendingStatsMtx.Lock()
+		defer pendingStatsMtx.Unlock()
+		for entityID, pending := range pendingStats {
+			if _, failed := failedEntityIDs[entityID]; failed {
+				getterLogger.WithField("user", pending.entity.Name()).Warnln("download failures kept the previous timeline watermark for a safe retry")
+				continue
+			}
+			if err := database.UpdateUserEntityTweetStat(db, entityID, pending.latest, pending.mediaCount); err != nil {
+				return fails, fmt.Errorf("failed to commit timeline watermark for user %s: %w", pending.entity.Name(), err)
+			}
+			pending.entity.record.LatestReleaseTime = sql.NullTime{Time: pending.latest, Valid: true}
+			pending.entity.record.MediaCount = sql.NullInt32{Int32: int32(pending.mediaCount), Valid: true}
+		}
 	}
 	log.Debugf("%d users unable to start", userEntityHeap.Size())
-	return fails, context.Cause(ctx)
+	return fails, cause
 }
 
 func downloadList(ctx context.Context, client *resty.Client, db *sqlx.DB, list twitter.ListBase, dir string, realDir string, autoFollow bool, additional []*resty.Client) ([]*TweetInEntity, error) {
