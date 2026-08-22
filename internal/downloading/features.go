@@ -214,7 +214,8 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 			continue
 		}
 
-		// 3. 无缝兼容老版本文件名平滑迁移
+		// 3. Detect legacy filenames, but do not claim them without proof that
+		// they belong to this tweet. Different tweets can share the same text.
 		var oldName string
 		cleanText := utils.WinFileName(tweet.Text)
 		if i == 0 {
@@ -225,31 +226,11 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 		oldPath := filepath.Join(dir, oldName)
 
 		if exists, _ := utils.PathExists(oldPath); exists {
-			// Rename locally
-			err := os.Rename(oldPath, path)
-			if err == nil {
-				log.Infof("Migrated file %s to %s on-the-fly", oldName, truncatedName)
-				if db != nil {
-					dbMedia := &database.MediaFileRecord{
-						TweetId:          tweet.Id,
-						Url:              u,
-						Filename:         truncatedName,
-						OriginalFilename: originalName,
-						DownloadStatus:   1,
-						DownloadedAt:     sql.NullTime{Time: time.Now(), Valid: true},
-					}
-					if fi, err := os.Stat(path); err == nil {
-						dbMedia.FileSize = sql.NullInt64{Int64: fi.Size(), Valid: true}
-					}
-					if err := saveMediaRecord(dbMedia); err != nil {
-						if renameErr := os.Rename(path, oldPath); renameErr != nil {
-							return fmt.Errorf("failed to save migrated media record: %v; failed to restore %s: %w", err, oldPath, renameErr)
-						}
-						return err
-					}
-				}
-				continue
-			}
+			log.WithFields(log.Fields{
+				"tweet_id":      tweet.Id,
+				"legacy_path":   oldPath,
+				"deterministic": path,
+			}).Warnln("ambiguous legacy media file was left untouched; downloading a deterministic copy")
 		}
 
 		// 4. Perform HTTP request to download
@@ -846,6 +827,13 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			cancel(fmt.Errorf("no client available"))
 			return
 		}
+		if depthByEntity[entity] > userTweetRateLimit {
+			// A non-blocking rate-limit error would discard GetMeidas' in-memory
+			// cursor and partial results. Waiting here preserves pagination across
+			// as many rate-limit windows as this unusually deep user requires.
+			twitter.SetRateLimitBlocking(cli, true)
+			defer twitter.SetRateLimitBlocking(cli, false)
+		}
 
 		baseline := entity.LatestReleaseTime()
 		_, explicitlyRequested := explicitUserIds[user.Id]
@@ -962,12 +950,10 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 					log.WithFields(log.Fields{
 						"user":  entity.Name(),
 						"depth": depth,
-					}).Warnln("user depth greater than the max limit of window")
-					userEntityHeap.Pop()
-					continue
+					}).Warnln("user requires multiple rate-limit windows; processing it alone")
 				}
 
-				if depth+count > userTweetRateLimit {
+				if depth+count > userTweetRateLimit && count > 0 {
 					break
 				}
 
