@@ -65,3 +65,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ./bin/*
+          body: |
+            `db_changed` 分支构建：加强数据库与文件升级恢复、媒体完整性检查和失败重试，并支持超长用户时间线。
+          prerelease: ${{ contains(github.ref_name, '-') }}
