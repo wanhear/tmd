@@ -144,6 +144,10 @@ func hasValidMP4FileTypeBox(body []byte) bool {
 	return boxSize >= headerSize+4 && boxSize <= uint64(len(body))
 }
 
+func mediaAttachmentError(index int, mediaURL string, err error) error {
+	return fmt.Errorf("attachment %d (%s): %w", index, mediaURL, err)
+}
+
 // Download every attachment that can still succeed. Retryable failures are
 // returned after the remaining attachments have been attempted.
 func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, dir string, tweet *twitter.Tweet) error {
@@ -168,7 +172,7 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 		ext, err := utils.GetExtFromUrl(u)
 		if err != nil {
 			if firstRetryErr == nil {
-				firstRetryErr = err
+				firstRetryErr = mediaAttachmentError(i+1, u, err)
 			}
 			continue
 		}
@@ -181,7 +185,7 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 		if db != nil {
 			mf, err := database.GetMediaFile(db, tweet.Id, u)
 			if err != nil {
-				return err
+				return mediaAttachmentError(i+1, u, fmt.Errorf("failed to load media record: %w", err))
 			}
 			if mf != nil && mf.DownloadStatus == 1 {
 				// Verify if file actually exists on disk
@@ -208,7 +212,7 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 					dbMedia.FileSize = sql.NullInt64{Int64: fi.Size(), Valid: true}
 				}
 				if err := saveMediaRecord(dbMedia); err != nil {
-					return err
+					return mediaAttachmentError(i+1, u, fmt.Errorf("failed to save existing media record: %w", err))
 				}
 			}
 			continue
@@ -272,7 +276,7 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 				return ctx.Err()
 			}
 			if firstRetryErr == nil {
-				firstRetryErr = err
+				firstRetryErr = mediaAttachmentError(i+1, u, err)
 			}
 			continue
 		}
@@ -295,17 +299,17 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 				}
 			}
 			if firstRetryErr == nil {
-				firstRetryErr = err
+				firstRetryErr = mediaAttachmentError(i+1, u, err)
 			}
 			continue
 		}
 
 		if _, err := writeMediaFileAtomically(path, bytes.NewReader(resp.Body()), tweet.CreatedAt); err != nil {
 			if errors.Is(err, syscall.ENOSPC) || ctx.Err() != nil {
-				return err
+				return mediaAttachmentError(i+1, u, fmt.Errorf("failed to write %s: %w", path, err))
 			}
 			if firstRetryErr == nil {
-				firstRetryErr = err
+				firstRetryErr = mediaAttachmentError(i+1, u, fmt.Errorf("failed to write %s: %w", path, err))
 			}
 			continue
 		}
@@ -322,7 +326,7 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, db *sqlx.DB, 
 				FileSize:         sql.NullInt64{Int64: int64(len(resp.Body())), Valid: true},
 			}
 			if err := saveMediaRecord(dbMedia); err != nil {
-				return err
+				return mediaAttachmentError(i+1, u, fmt.Errorf("failed to save downloaded media record: %w", err))
 			}
 		}
 	}
@@ -384,13 +388,27 @@ func tweetDownloader(client *resty.Client, config *workerConfig, errch chan<- Pa
 			return
 		}
 
+		tweet := pt.GetTweet()
+		fields := log.Fields{}
+		if tweet != nil {
+			fields["tweet_id"] = tweet.Id
+			if tweet.Creator != nil {
+				fields["user"] = tweet.Creator.Title()
+			}
+		}
+
 		path := pt.GetPath()
 		if path == "" {
+			log.WithFields(fields).Errorln("media target directory is unavailable; keeping tweet in retry queue")
 			errch <- pt
 			continue
 		}
-		err := downloadTweetMedia(config.ctx, client, config.db, path, pt.GetTweet())
+		fields["target_dir"] = path
+		err := downloadTweetMedia(config.ctx, client, config.db, path, tweet)
 		if err != nil {
+			if config.ctx.Err() == nil {
+				log.WithError(err).WithFields(fields).Warnln("tweet media download failed; keeping tweet in retry queue")
+			}
 			errch <- pt
 		}
 
