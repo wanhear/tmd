@@ -743,17 +743,15 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		failedEntityIDs[failed.Entity.Id()] = struct{}{}
 	}
 	cause := context.Cause(ctx)
-	if cause == nil {
-		pendingStatsMtx.Lock()
-		defer pendingStatsMtx.Unlock()
-		for entityID, pending := range pendingStats {
-			if _, failed := failedEntityIDs[entityID]; failed {
-				getterLogger.WithField("user", pending.entity.Name()).Warnln("download failures kept the previous timeline watermark for a safe retry")
-				continue
-			}
-			if err := database.UpdateUserEntityTweetStat(db, entityID, pending.latest, pending.mediaCount); err != nil {
-				return fails, fmt.Errorf("failed to commit timeline watermark for user %s: %w", pending.entity.Name(), err)
-			}
+	pendingStatsMtx.Lock()
+	defer pendingStatsMtx.Unlock()
+	for entityID, pending := range pendingStats {
+		if _, failed := failedEntityIDs[entityID]; failed {
+			getterLogger.WithField("user", pending.entity.Name()).Warnln("download failures kept the previous timeline watermark for a safe retry")
+			continue
+		}
+		if err := database.UpdateUserEntityTweetStat(db, entityID, pending.latest, pending.mediaCount); err != nil {
+			return fails, fmt.Errorf("failed to commit timeline watermark for user %s: %w", pending.entity.Name(), err)
 		}
 	}
 	log.Debugf("%d users unable to start", userEntityHeap.Size())
