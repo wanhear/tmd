@@ -45,7 +45,7 @@
 **自行编译**
 
 ```bash
-git clone https://github.com/unkmonster/tmd
+git clone --branch db_changed --single-branch https://github.com/wanhear/tmd.git
 cd tmd
 go build .
 ```
@@ -81,7 +81,16 @@ tmd --foll <user_id>       // 批量下载由 user_id 指定的用户正关注�
 tmd --foll <screen_name>   // 批量下载由 screen_name 指定的用户正关注的每个用户
 tmd --auto-follow          // 自动关注受保护的用户
 tmd --no-retry             // 仅转储，不在程序退出前自动重试下载失败的推文
+tmd --upgrade              // 升级数据库并迁移旧媒体文件名
+tmd --rollback             // 恢复升级记录的文件改名并清除升级完成状态
 ```
+
+#### db_changed 分支新增命令
+
+- `tmd --upgrade`：升级旧数据库和媒体文件名；中断或部分失败后可以再次运行并从已有进度继续。
+- `tmd --rollback`：撤销升级过程中已经记录的文件改名，并清除升级完成状态，以便之后重新升级。
+
+两个命令运行前都会自动备份数据库，且不能同时使用。升级产生的媒体下载失败会保留在失败队列中，由之后的正常下载命令继续重试。
 
 > 为了创建符号链接，在 Windows 上应该以管理员身份运行程序
 
