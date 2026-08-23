@@ -216,11 +216,13 @@ func makeRateLimit(resp *resty.Response) *xRateLimit {
 type rateLimiter struct {
 	limits      sync.Map
 	conds       sync.Map
-	nonBlocking bool
+	nonBlocking atomic.Bool
 }
 
-func newRateLimiter(nonBlocking bool) rateLimiter {
-	return rateLimiter{nonBlocking: nonBlocking}
+func newRateLimiter(nonBlocking bool) *rateLimiter {
+	limiter := &rateLimiter{}
+	limiter.nonBlocking.Store(nonBlocking)
+	return limiter
 }
 
 func (rateLimiter *rateLimiter) check(ctx context.Context, url *url.URL) error {
@@ -262,7 +264,7 @@ func (rateLimiter *rateLimiter) check(ctx context.Context, url *url.URL) error {
 
 	// limiter 为 nil 意味着不对此路径做速率限制
 	if limit != nil {
-		return limit.preRequest(ctx, rateLimiter.nonBlocking)
+		return limit.preRequest(ctx, rateLimiter.nonBlocking.Load())
 	}
 	return nil
 }
@@ -314,9 +316,19 @@ func (rl *rateLimiter) wouldBlock(path string) bool {
 	return false
 }
 
+func SetRateLimitBlocking(client *resty.Client, blocking bool) {
+	if v, ok := clientRateLimiters.Load(client); ok {
+		rl := v.(*rateLimiter)
+		log.Infof("[RateLimiter] SetRateLimitBlocking: changing nonBlocking from %v to %v for client %p", rl.nonBlocking.Load(), !blocking, client)
+		rl.nonBlocking.Store(!blocking)
+	} else {
+		log.Warnf("[RateLimiter] SetRateLimitBlocking: client %p not found in rate limiters map", client)
+	}
+}
+
 func EnableRateLimit(client *resty.Client) {
 	rateLimiter := newRateLimiter(true)
-	clientRateLimiters.Store(client, &rateLimiter)
+	clientRateLimiters.Store(client, rateLimiter)
 
 	client.OnBeforeRequest(func(c *resty.Client, req *resty.Request) error {
 		u, err := url.Parse(req.URL)

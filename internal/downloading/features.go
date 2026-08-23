@@ -615,6 +615,13 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			cancel(fmt.Errorf("no client available"))
 			return
 		}
+		if depthByEntity[entity] > userTweetRateLimit {
+			// A non-blocking rate-limit error would discard GetMeidas' in-memory
+			// cursor and partial results. Waiting here preserves pagination across
+			// as many rate-limit windows as this unusually deep user requires.
+			twitter.SetRateLimitBlocking(cli, true)
+			defer twitter.SetRateLimitBlocking(cli, false)
+		}
 
 		tweets, err := user.GetMeidas(ctx, cli, &utils.TimeRange{Min: entity.LatestReleaseTime()})
 		if err == twitter.ErrWouldBlock {
@@ -701,12 +708,10 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 					log.WithFields(log.Fields{
 						"user":  entity.Name(),
 						"depth": depth,
-					}).Warnln("user depth greater than the max limit of window")
-					userEntityHeap.Pop()
-					continue
+					}).Warnln("user requires multiple rate-limit windows; processing it alone")
 				}
 
-				if depth+count > userTweetRateLimit {
+				if depth+count > userTweetRateLimit && count > 0 {
 					break
 				}
 
