@@ -391,8 +391,24 @@ func syncUserAndEntity(db *sqlx.DB, user *twitter.User, dir string) (*UserEntity
 }
 
 type TweetInEntity struct {
-	Tweet  *twitter.Tweet
-	Entity *UserEntity
+	Tweet                    *twitter.Tweet
+	Entity                   *UserEntity
+	pendingLatestReleaseTime time.Time
+	pendingMediaCount        int
+}
+
+// CommitPersistedRetryProgress advances watermarks that were held back until
+// the caller confirmed that the failed tweets were written to its retry queue.
+func CommitPersistedRetryProgress(db *sqlx.DB, failed []*TweetInEntity) error {
+	for _, item := range failed {
+		if item == nil || item.pendingLatestReleaseTime.IsZero() {
+			continue
+		}
+		if err := database.UpdateUserEntityTweetStat(db, item.Entity.Id(), item.pendingLatestReleaseTime, item.pendingMediaCount); err != nil {
+			return fmt.Errorf("failed to commit persisted retry watermark for user %s: %w", item.Entity.Name(), err)
+		}
+	}
+	return nil
 }
 
 func (pt TweetInEntity) GetTweet() *twitter.Tweet {
@@ -736,18 +752,29 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	}()
 
 	fails := []*TweetInEntity{}
-	failedEntityIDs := make(map[int]struct{})
+	failedProgressByEntity := make(map[int]*TweetInEntity)
 	for pt := range errChan {
 		failed := pt.(*TweetInEntity)
 		fails = append(fails, failed)
-		failedEntityIDs[failed.Entity.Id()] = struct{}{}
+		entityID := failed.Entity.Id()
+		if _, exists := failedProgressByEntity[entityID]; !exists {
+			failedProgressByEntity[entityID] = failed
+		}
 	}
 	cause := context.Cause(ctx)
 	pendingStatsMtx.Lock()
 	defer pendingStatsMtx.Unlock()
+	for entityID, failed := range failedProgressByEntity {
+		pending, ok := pendingStats[entityID]
+		if !ok {
+			continue
+		}
+		failed.pendingLatestReleaseTime = pending.latest
+		failed.pendingMediaCount = pending.mediaCount
+		getterLogger.WithField("user", pending.entity.Name()).Warnln("timeline watermark will advance after failed tweets are saved to the retry queue")
+	}
 	for entityID, pending := range pendingStats {
-		if _, failed := failedEntityIDs[entityID]; failed {
-			getterLogger.WithField("user", pending.entity.Name()).Warnln("download failures kept the previous timeline watermark for a safe retry")
+		if failedProgressByEntity[entityID] != nil {
 			continue
 		}
 		if err := database.UpdateUserEntityTweetStat(db, entityID, pending.latest, pending.mediaCount); err != nil {
