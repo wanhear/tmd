@@ -434,6 +434,9 @@ func main() {
 			log.Errorf("failed to save retry queue: %v", err)
 		} else {
 			log.Infof("%d tweets have been dumped and will be downloaded the next time the program runs", dumper.Count())
+			if err := downloading.CommitPersistedRetryProgress(db, todump); err != nil {
+				log.Errorf("retry queue was saved, but failed to advance persisted timeline watermarks: %v", err)
+			}
 		}
 	}()
 
