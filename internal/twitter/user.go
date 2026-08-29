@@ -183,29 +183,46 @@ func filterTweetsByTimeRange(tweets []*Tweet, min *time.Time, max *time.Time) (c
 	return
 }
 
-func (u *User) GetMeidas(ctx context.Context, client *resty.Client, timeRange *utils.TimeRange) ([]*Tweet, error) {
+type MediaTimelineProgress struct {
+	api       userMedia
+	results   []*Tweet
+	firstPage bool
+	minTime   *time.Time
+	maxTime   *time.Time
+}
+
+func (u *User) NewMediaTimelineProgress(timeRange *utils.TimeRange) *MediaTimelineProgress {
+	progress := &MediaTimelineProgress{
+		api: userMedia{
+			userId: u.Id,
+			count:  100,
+			cursor: "",
+		},
+		results:   make([]*Tweet, 0),
+		firstPage: true,
+	}
+	if timeRange != nil {
+		minTime := timeRange.Min
+		maxTime := timeRange.Max
+		progress.minTime = &minTime
+		progress.maxTime = &maxTime
+	}
+	return progress
+}
+
+// ContinueGetMeidas resumes a media timeline request from its last completed
+// page. If the rate limiter returns ErrWouldBlock, progress retains both the
+// cursor and the pages already fetched so the caller can continue later.
+func (u *User) ContinueGetMeidas(ctx context.Context, client *resty.Client, progress *MediaTimelineProgress) ([]*Tweet, error) {
 	if !u.IsVisiable() {
 		return nil, nil
 	}
-
-	api := userMedia{}
-	api.count = 100
-	api.cursor = ""
-	api.userId = u.Id
-
-	results := make([]*Tweet, 0)
-	firstPage := true
-
-	var minTime *time.Time
-	var maxTime *time.Time
-
-	if timeRange != nil {
-		minTime = &timeRange.Min
-		maxTime = &timeRange.Max
+	if progress == nil {
+		progress = u.NewMediaTimelineProgress(nil)
 	}
 
 	for {
-		currentTweets, next, rawItemCount, err := u.getMediasOnePage(ctx, &api, client)
+		currentTweets, next, rawItemCount, err := u.getMediasOnePage(ctx, &progress.api, client)
 		if err != nil {
 			return nil, err
 		}
@@ -214,7 +231,7 @@ func (u *User) GetMeidas(ctx context.Context, client *resty.Client, timeRange *u
 			// The media timeline may occasionally return a cursor-only first
 			// page. Advance once so that a blank landing page does not make a
 			// non-empty timeline look complete.
-			if firstPage && next != "" && next != api.cursor {
+			if progress.firstPage && next != "" && next != progress.api.cursor {
 				log.WithFields(log.Fields{
 					"user":                 u.Title(),
 					"user_id":              u.Id,
@@ -224,11 +241,11 @@ func (u *User) GetMeidas(ctx context.Context, client *resty.Client, timeRange *u
 					"expected_media_count": u.MediaCount,
 					"has_next_cursor":      true,
 				}).Infoln("media timeline returned a cursor-only first page; advancing to the next cursor")
-				api.SetCursor(next)
-				firstPage = false
+				progress.api.SetCursor(next)
+				progress.firstPage = false
 				continue
 			}
-			if len(results) == 0 && u.MediaCount > 0 {
+			if len(progress.results) == 0 && u.MediaCount > 0 {
 				log.WithFields(log.Fields{
 					"user":                 u.Title(),
 					"user_id":              u.Id,
@@ -237,32 +254,36 @@ func (u *User) GetMeidas(ctx context.Context, client *resty.Client, timeRange *u
 					"parsed_media_tweets":  0,
 					"expected_media_count": u.MediaCount,
 					"has_next_cursor":      next != "",
-					"first_page":           firstPage,
+					"first_page":           progress.firstPage,
 				}).Warnln("media timeline ended without returning any parseable media tweets")
 			}
 			break // empty page
 		}
 
-		firstPage = false
-		api.SetCursor(next)
+		progress.firstPage = false
+		progress.api.SetCursor(next)
 
-		if timeRange == nil {
-			results = append(results, currentTweets...)
+		if progress.minTime == nil && progress.maxTime == nil {
+			progress.results = append(progress.results, currentTweets...)
 			continue
 		}
 
 		// 筛选推文，并判断是否获取下页
-		cutMin, cutMax, currentTweets := filterTweetsByTimeRange(currentTweets, minTime, maxTime)
-		results = append(results, currentTweets...)
+		cutMin, cutMax, currentTweets := filterTweetsByTimeRange(currentTweets, progress.minTime, progress.maxTime)
+		progress.results = append(progress.results, currentTweets...)
 
 		if cutMin {
 			break
 		}
 		if cutMax && len(currentTweets) != 0 {
-			maxTime = nil
+			progress.maxTime = nil
 		}
 	}
-	return results, nil
+	return progress.results, nil
+}
+
+func (u *User) GetMeidas(ctx context.Context, client *resty.Client, timeRange *utils.TimeRange) ([]*Tweet, error) {
+	return u.ContinueGetMeidas(ctx, client, u.NewMediaTimelineProgress(timeRange))
 }
 
 func (u *User) Title() string {

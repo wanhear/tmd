@@ -35,6 +35,10 @@ func (hp *Heap[T]) Push(val T) {
 }
 
 func (hp *Heap[T]) Pop() {
+	hp.PopValue()
+}
+
+func (hp *Heap[T]) PopValue() T {
 	hp.mtx.Lock()
 	defer hp.mtx.Unlock()
 
@@ -43,9 +47,11 @@ func (hp *Heap[T]) Pop() {
 		panic("heap is empty")
 	}
 
+	val := hp.data[0]
 	hp.swap(0, n-1)
 	hp.data = hp.data[:n-1]
 	hp.siftDown(0)
+	return val
 }
 
 func (hp *Heap[T]) Peek() T {

@@ -839,6 +839,14 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	}
 	pendingStats := make(map[int]pendingTweetStat)
 	var pendingStatsMtx sync.Mutex
+	mediaProgress := sync.Map{}
+	var retryEntities []*UserEntity
+	var retryEntitiesMtx sync.Mutex
+	retryEntity := func(entity *UserEntity) {
+		retryEntitiesMtx.Lock()
+		retryEntities = append(retryEntities, entity)
+		retryEntitiesMtx.Unlock()
+	}
 
 	producer := func(entity *UserEntity) {
 		defer prodwg.Done()
@@ -853,11 +861,11 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			cli = twitter.SelectUserMediaClient(ctx, clients)
 		}
 		if ctx.Err() != nil {
-			userEntityHeap.Push(entity)
+			retryEntity(entity)
 			return
 		}
 		if cli == nil {
-			userEntityHeap.Push(entity)
+			retryEntity(entity)
 			cancel(fmt.Errorf("no client available"))
 			return
 		}
@@ -885,7 +893,8 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			requestLogger.Infoln("requesting media timeline for explicitly requested user")
 		}
 
-		tweets, err := user.GetMeidas(ctx, cli, &utils.TimeRange{Min: baseline})
+		progressValue, _ := mediaProgress.LoadOrStore(entity.Id(), user.NewMediaTimelineProgress(&utils.TimeRange{Min: baseline}))
+		tweets, err := user.ContinueGetMeidas(ctx, cli, progressValue.(*twitter.MediaTimelineProgress))
 		if explicitlyRequested {
 			resultLogger := requestLogger.WithFields(log.Fields{
 				"returned_tweets": len(tweets),
@@ -900,29 +909,31 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			}
 		}
 		if err == twitter.ErrWouldBlock {
-			userEntityHeap.Push(entity)
+			retryEntity(entity)
 			return
 		}
 		if v, ok := err.(*twitter.TwitterApiError); ok {
 			// 客户端不再可用
 			if v.Code == twitter.ErrExceedPostLimit {
 				twitter.SetClientError(cli, fmt.Errorf("reached the limit for seeing posts today"))
-				userEntityHeap.Push(entity)
+				retryEntity(entity)
 				return
 			} else if v.Code == twitter.ErrAccountLocked {
 				twitter.SetClientError(cli, fmt.Errorf("account is locked"))
-				userEntityHeap.Push(entity)
+				retryEntity(entity)
 				return
 			}
 		}
 		if ctx.Err() != nil {
-			userEntityHeap.Push(entity)
+			retryEntity(entity)
 			return
 		}
 		if err != nil {
+			mediaProgress.Delete(entity.Id())
 			getterLogger.WithField("user", entity.Name()).Warnln("failed to get user medias:", err)
 			return
 		}
+		mediaProgress.Delete(entity.Id())
 
 		if len(tweets) == 0 {
 			if err := database.UpdateUserEntityMediCount(db, entity.Id(), user.MediaCount); err != nil {
@@ -967,6 +978,16 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		return nil, err
 	}
 	defer ants.Release()
+	submitProducer := func(entity *UserEntity) error {
+		prodwg.Add(1)
+		if err := producerPool.Submit(func() {
+			producer(entity)
+		}); err != nil {
+			prodwg.Done()
+			return err
+		}
+		return nil
+	}
 
 	//closer
 	go func() {
@@ -991,18 +1012,29 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 					break
 				}
 
-				prodwg.Add(1)
-				producerPool.Submit(func() {
-					producer(entity)
-				})
+				entity = userEntityHeap.PopValue()
+				if err := submitProducer(entity); err != nil {
+					retryEntity(entity)
+					cancel(fmt.Errorf("failed to submit user media task: %w", err))
+					break
+				}
 				selected = append(selected, depth)
 
 				count += depth
-				//delete(depthByEntity, entity)
-				userEntityHeap.Pop()
 			}
 			log.Debugln(selected)
 			prodwg.Wait()
+
+			// Producers do not mutate the scheduling heap. Deferred entities are
+			// reinserted only after the current batch is completely idle, so a
+			// retry cannot change which entity the scheduler removes.
+			retryEntitiesMtx.Lock()
+			toRetry := retryEntities
+			retryEntities = nil
+			retryEntitiesMtx.Unlock()
+			for _, entity := range toRetry {
+				userEntityHeap.Push(entity)
+			}
 		}
 		close(tweetChan)
 		log.Debugf("getting tweets completed, elapsed time: %v", time.Since(start))
