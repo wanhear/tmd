@@ -154,12 +154,8 @@ func (rl *xRateLimit) preRequest(ctx context.Context, nonBlocking bool) error {
 			"until": rl.ResetTime.Add(insurance),
 		}).Warnln("[RateLimiter] start sleeping")
 
-		origin, err := utils.GetConsoleTitle()
-		if err == nil {
-			utils.SetConsoleTitle(fmt.Sprintf("idle - sleeping until %v", rl.ResetTime.Add(insurance).Format(time.TimeOnly)))
-			defer utils.SetConsoleTitle(origin)
-		} else {
-			log.Warnln("failed to set console title:", err)
+		if restoreTitle := trySetTemporaryConsoleTitle(fmt.Sprintf("idle - sleeping until %v", rl.ResetTime.Add(insurance).Format(time.TimeOnly))); restoreTitle != nil {
+			defer restoreTitle()
 		}
 
 		select {
@@ -505,6 +501,36 @@ func GetClientRateLimiter(cli *resty.Client) *rateLimiter {
 
 var showStateToken = make(chan struct{}, 1)
 
+// trySetTemporaryConsoleTitle serializes temporary title ownership. Without
+// this, concurrent rate-limit waiters can restore a stale temporary title
+// after the operation that originally displayed it has already resumed.
+func trySetTemporaryConsoleTitle(title string) func() {
+	select {
+	case showStateToken <- struct{}{}:
+	default:
+		return nil
+	}
+
+	origin, err := utils.GetConsoleTitle()
+	if err != nil {
+		<-showStateToken
+		log.Debugln("failed to get console title:", err)
+		return nil
+	}
+	if err := utils.SetConsoleTitle(title); err != nil {
+		<-showStateToken
+		log.Debugln("failed to set console title:", err)
+		return nil
+	}
+
+	return func() {
+		if err := utils.SetConsoleTitle(origin); err != nil {
+			log.Debugln("failed to restore console title:", err)
+		}
+		<-showStateToken
+	}
+}
+
 // 选择一个请求指定端点不会阻塞的客户端
 func SelectClient(ctx context.Context, clients []*resty.Client, path string) *resty.Client {
 	for ctx.Err() == nil {
@@ -525,18 +551,9 @@ func SelectClient(ctx context.Context, clients []*resty.Client, path string) *re
 			return nil // no client available
 		}
 
-		select {
-		default:
-		case showStateToken <- struct{}{}:
-			defer func() { <-showStateToken }()
+		if restoreTitle := trySetTemporaryConsoleTitle("waiting for any client to wake up"); restoreTitle != nil {
+			defer restoreTitle()
 			log.Warnln("waiting for any client to wake up")
-			origin, err := utils.GetConsoleTitle()
-			if err == nil {
-				defer utils.SetConsoleTitle(origin)
-				utils.SetConsoleTitle("waiting for any client to wake up")
-			} else {
-				log.Debugln("failed to get console title:", err)
-			}
 		}
 
 		select {
